@@ -96,7 +96,7 @@ At startup the process prints a health line, for example:
 
 If the control bot cannot reach you, the log says so in one line and the userbot keeps running: open the bot in Telegram and press /start once.
 
-Useful checks that need no Telegram connection: `python auto_reply.py --env-check`, `--db-check`, `--commands-check`, `--tools-check` (`--tools-check --net` also hits the live weather/Wikipedia endpoints), `--test-decisions`, `--daily-preview`. With credentials in place, `--presence-check` shows which accounts connect and whether you currently count as away, and `--self-test` exercises the whole reply pipeline.
+Useful checks that need no Telegram connection: `python auto_reply.py --env-check`, `--db-check`, `--commands-check`, `--tools-check` (`--tools-check --net` also hits the live weather/Wikipedia endpoints), `--deploy-check` (the Dockerfile and `.dockerignore` rules Railway validates before building), `--signal-check` (a real SIGTERM still ends in a clean shutdown, as `docker stop` sends it), `--behavior-check` (the reviewed bugs, tested against a throwaway database), `--test-decisions`, `--daily-preview`. With credentials in place, `--presence-check` shows which accounts connect and whether you currently count as away, and `--self-test` exercises the whole reply pipeline.
 
 ## Environment variables
 
@@ -117,7 +117,7 @@ All configuration is read from the environment at runtime. `python-dotenv` also 
 | `LOG_LEVEL` | no | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` for the log file. |
 | `PROXY` | no | empty | Proxy for a blocked or filtered network: `socks5://user:pass@host:port`, `http://host:port`, or `host:port:secret` for an MTProxy. |
 
-The behaviour values (`report_mode`, `cooldown_minutes`, the spam threshold and window, the reply texts, the daily-report time) live in `state.db`, seeded from `config.json`, and are edited live from the control-bot panel. Setting their environment counterparts is a way to declare the intended defaults for a fresh deployment, not a hard override of what the database already holds.
+The behaviour values (`report_mode`, `group_report_mode`, `cooldown_minutes`, the spam threshold and window, the reply texts, the daily-report time) live in `state.db`, seeded from `config.json`, and are edited live from the control-bot panel. Setting their environment counterparts is a way to declare the intended defaults for a fresh deployment, not a hard override of what the database already holds.
 
 ## Commands
 
@@ -137,7 +137,7 @@ The first block is the core bot; the other three come from the optional feature 
 | `/set_text`, `/set_spam_text`, `/set_group_text <text>` | the three reply texts, `{name}` = the other person |
 | `/ignore_add`, `/ignore_remove`, `/ignore_list` | people who are never answered |
 | `/group_add`, `/group_remove`, `/group_list` | groups where mentions get the group text |
-| `/report_mode <all\|offline_only>`, `/report_now`, `/errors_clear`, `/reload_config` | reports and maintenance |
+| `/report_mode <all\|offline_only>`, `/group_mode <away\|mentions\|all>`, `/report_now`, `/errors_clear`, `/reload_config` | reports and maintenance |
 | `/help` | the whole command list |
 
 ### Profile and messages
@@ -188,8 +188,14 @@ The repository deploys as-is: `railway.json` selects the `Dockerfile` builder, a
 1. **New Project** → **Deploy from GitHub repo**.
 2. **Paste the repository URL** (or pick it from your GitHub list) and let Railway import it.
 3. Open the service → **Variables** and add the five required variables: `API_ID`, `API_HASH`, `SESSION_STRING`, `BOT_TOKEN`, `OWNER_ID`. Add any optional one you want (`DATA_DIR`, `REPORT_MODE`, `COOLDOWN_MINUTES`, `TIMEZONE`, `LOG_LEVEL`, `PROXY`, `WATCHER_SESSION_STRING`) — never put them in the repository.
-4. **Add a Volume** to the service and mount it at the path in `DATA_DIR` — `/data`, which is what the image sets. Without a volume the database is recreated on every redeploy and all counters and settings are lost.
-5. **Deploy** and watch the logs. A healthy start ends with the `config: …` health line.
+4. **Add a Volume** to the service and mount it at the path in `DATA_DIR` — `/data`, which is what the image sets. Without a volume the database is recreated on every redeploy and all counters and settings are lost. The volume is created here in the dashboard, *not* with a `VOLUME` line in the `Dockerfile` — Railway validates the Dockerfile before the build, rejects that instruction with `dockerfile invalid: docker VOLUME at Line N is not supported, use Railway Volumes`, and fails the deployment immediately.
+5. **`.dockerignore` is part of the build.** Everything it does not exclude is uploaded to the builder, and the
+   `Dockerfile` copies `*.py` from that context, so the local helper scripts, `*.session` files, `state.db` and
+   `.env` are kept out of the image by name there. `--deploy-check` fails if a secret becomes reachable that way or
+   if a module the bot needs is excluded by mistake.
+6. **Deploy** and watch the logs. A healthy start ends with the `config: …` health line. The container is PID 1 and
+   handles `SIGTERM` (what `docker stop`, a redeploy and `docker compose down` send), so a restart closes the sqlite
+   database and disconnects both clients instead of dropping them mid-write — `--signal-check` proves it offline.
 
 Two notes specific to this app:
 
@@ -204,17 +210,29 @@ Open your bot in Telegram and send **/menu**. Every screen is inline buttons, ev
 | Screen | What you can do |
 | --- | --- |
 | **Main menu** | toggle auto-reply on/off, jump to any screen, close the panel |
-| **Status** | live overview: enabled, detection mode, cooldown, spam rule, report mode, daily-report time, number of ignored people and allowed groups, database counters, today's messages |
+| **Status** | live overview: enabled, detection mode, cooldown, spam rule, report mode, how loud a group is, daily-report time, number of ignored people and allowed groups, database counters, today's messages |
 | **Reply texts** | edit the normal reply, the spam warning and the group text; `{name}` is replaced with the other person's name |
 | **Ignore list** | add or remove people (numeric id or `@username`) so they are never answered |
 | **Allowed groups** | add or remove groups (numeric id like `-100…`, or `@username` when the bot is a member) where the group text may be used |
 | **Settings** | cooldown per person, spam threshold, spam window, detection mode (presence / idle / offline) |
-| **Reports** | report mode (`all` / `offline_only`), daily-report time, daily report on/off, error reports on/off, startup message on/off |
+| **Reports** | report mode (`all` / `offline_only`), how loud an allowed group is (`away` = every message there but only while you are away, `mentions` = only a mention of you or a reply to one of your messages, `all` = always), daily-report time, daily report on/off, error reports on/off, startup message on/off |
 | **Errors** | the last error lines and a button to clear the list |
 
 Notification buttons, available on every reported message: **🚫 ignore this user**, **✍️ answer as Hermes** (type your text — it is sent as you), **✅ mark as read**.
 
 Text commands, if you prefer typing: `/menu`, `/status`, `/on`, `/off`, `/ignore <id or @username>`, `/unignore <id or @username>`, `/mode all|offline_only`, `/cooldown <minutes>`, `/help`, `/cancel`.
+
+## If something looks wrong
+
+| Symptom | What it means |
+| --- | --- |
+| `ERROR [missing_credentials] API_ID, API_HASH is required …` and the process exits | Startup found no credentials and says so in one line instead of a traceback. Set `API_ID` and `API_HASH` (and `SESSION_STRING`). A malformed `SESSION_STRING` is reported the same way. |
+| `ERROR [invalid_session] …` | The `SESSION_STRING` is corrupt or was built with another `API_ID`. Run `python generate_session.py` again. |
+| The log says `entity cache warmed: 0 dialogs` | The session is signed in but Telegram returned no dialogs. Replying to a person who has not written since the restart can then fail with `Could not find the input entity` — send that person a message once, or check that the session is not a brand-new one. |
+| The status screen shows a "raw presence" line | The detection mode is forced (`online`/`offline`), your own messages are recent, or the idle fallback decided — the first line is the decision, the raw line is the measurement behind it. |
+| Presence says `UserStatusRecently - coarse status …` | The watcher account is not allowed to see your exact last-seen time, so an actually-online owner also reads as *recently* and the bot would answer. Telegram → **Settings → Privacy and Security → Last Seen & Online** → add the watcher account (or *Everybody*). |
+| The control bot reports every message in a busy group | `/group_mode mentions` (only a mention of you or a reply to one of your messages) or `away` (only while you are away, which is the default). |
+| No last-seen times and no replies at all from bots | Bots are ignored by design (`ignore_bots`): a message from a bot is not counted, not journalled and never notified — the control bot talks to you through this same account. |
 
 ## Security
 

@@ -22,7 +22,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # .env next to the code, for local development. override=False keeps real
 # environment variables (Railway, Docker, systemd) winning over the file.
-load_dotenv(os.path.join(HERE, ".env"), override=False)
+# AUTO_REPLY_SKIP_DOTENV=1 ignores the file entirely: the self-checks use it so
+# "no credentials" really means no credentials (a server never has a .env).
+if not os.environ.get("AUTO_REPLY_SKIP_DOTENV"):
+    load_dotenv(os.path.join(HERE, ".env"), override=False)
 
 
 def _resolve_data_dir() -> str:

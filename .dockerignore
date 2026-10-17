@@ -1,0 +1,65 @@
+# Build context only. Docker has no per-COPY ignore and the Dockerfile runs
+# "COPY *.py ./", so anything not listed here is uploaded to the builder AND
+# copied into the image. Keep this file in sync when a helper or a data file is
+# added: a local script left out of it ends up inside the published image.
+#
+# The published image needs exactly: the tracked modules (*.py), config.json and
+# requirements.txt. Everything else is local state, local tooling or docs.
+
+# --- secrets: never uploaded, never in the image -----------------------------
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+*.jsonl
+*.log
+pause.flag
+config.local.json
+credentials*.json
+*.pem
+*.key
+
+# --- runtime state (lives in DATA_DIR, never in the image) -------------------
+data/
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# --- local-only helper scripts (untracked: machine paths, ids, one-off keys) --
+prep_env.py
+claim_bot.py
+list_bots.py
+whoami.py
+net_probe.py
+login.py
+login_watch.py
+check*.py
+*_local.py
+
+# --- local run helpers, editors, VCS leftovers -------------------------------
+*.cmd
+*.bat
+*.ps1
+*.vbs
+autostart-off/
+archive/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.git/
+.github/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- docs and deployment extras (not needed to build or run) -----------------
+*.md
+deploy/

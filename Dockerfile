@@ -68,19 +68,24 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 
-# The source is copied explicitly instead of with "COPY . .": Docker has no
-# exclude syntax, and a blanket copy would bake a local .env or *.session file
-# into the image. Keep this pattern in sync if a sub-package is ever added.
+# The source is copied explicitly instead of with "COPY . .", and *.py means
+# whatever the build context contains: .dockerignore is what keeps the local
+# helpers, *.session files, state.db and .env out of that context (and therefore
+# out of the image). Add a rule there whenever a local script is added; the
+# --deploy-check self-test fails if the two drift apart.
 COPY --chown=appuser:appuser *.py ./
 COPY --chown=appuser:appuser config.json ./
 
-# Platforms may inject a volume at /data; create the path so it always exists
-# and belongs to the runtime user.
+# Platforms mount a volume here; create the path in the image so it always
+# exists and belongs to the runtime user.
+#
+# No VOLUME instruction on purpose: Railway's pre-build validator rejects it
+# ("dockerfile invalid: docker VOLUME at Line N is not supported, use Railway
+# Volumes") and fails the deployment before the build even starts. Attach a
+# Railway Volume mounted at /data instead, and keep the -v flag for docker run.
 RUN mkdir -p /data && chown appuser:appuser /data
 
 USER appuser
-
-VOLUME ["/data"]
 
 # No EXPOSE: both clients only dial out to Telegram, nothing ever listens.
 # Liveness without a port - PID 1 must still be alive and DATA_DIR must be
@@ -90,4 +95,9 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=3 \
     CMD ["python", "-c", "import os,sys; os.kill(1,0); sys.exit(0 if os.access(os.environ.get('DATA_DIR','/data'), os.W_OK) else 1)"]
 
 # Never prompts for anything: the login session comes from SESSION_STRING.
+#
+# This is PID 1, so the process receives SIGTERM directly on `docker stop`, a
+# Railway redeploy or `docker compose down`. auto_reply.py installs a handler for
+# it (and for Ctrl+C) so the clients disconnect and the sqlite database is closed
+# instead of being dropped mid-write - verified by --signal-check.
 CMD ["python", "auto_reply.py"]

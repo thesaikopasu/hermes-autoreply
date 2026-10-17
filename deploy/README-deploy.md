@@ -112,6 +112,15 @@ port, and restarts the service 10 seconds after it dies (`Restart=always`, `Rest
 5. **Deploy.** No port, no domain and no healthcheck path are needed: nothing listens, the container only dials
    out to Telegram. Railway restarts the service automatically when it exits, capped at 10 retries.
 
+> The `Dockerfile` has **no `VOLUME` instruction on purpose.** Railway validates the Dockerfile before the build
+> and fails there with `dockerfile invalid: docker VOLUME at Line N is not supported, use Railway Volumes`, so
+> the volume is created in the dashboard (step 3) instead. `python auto_reply.py --deploy-check` re-checks that
+> rule, the `.dockerignore` rules and the rest of the Dockerfile without needing a Docker daemon.
+>
+> The container runs as PID 1 and installs a `SIGTERM`/`SIGINT` handler, so `docker stop`, a redeploy and
+> `docker compose down` all end in a clean shutdown (clients disconnected, sqlite closed). `--signal-check`
+> verifies that path offline; without the handler the process is killed where it stands.
+
 ---
 
 ## Any other container host

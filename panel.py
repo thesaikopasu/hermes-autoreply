@@ -55,6 +55,14 @@ MODE_LABELS = {
     "presence": "همه‌ی پیام‌ها",
     "offline_only": "فقط وقتی آفلاین",  # (report_mode)
 }
+
+# group_report_mode: how loud an allowed group is.
+GROUP_MODE_LABELS = {
+    "away": "فقط وقتی آفلاین",      # every message there, but only while the owner is away
+    "mentions": "فقط منشن یا ریپلای",  # a mention of the owner, or a reply to one of his messages
+    "all": "همه‌ی پیام‌ها",          # every message, always
+}
+GROUP_MODE_ORDER = ("away", "mentions", "all")
 OFFLINE_MODES = ("presence", "idle", "offline")
 
 HELP_TEXT = (
@@ -66,6 +74,7 @@ HELP_TEXT = (
     "/ignore <آیدی یا @یوزرنیم> — افزودن به لیست نادیده\n"
     "/unignore <آیدی یا @یوزرنیم> — حذف از لیست نادیده\n"
     "/mode all|offline_only — حالت گزارش‌ها\n"
+    "/group_mode away|mentions|all — شلوغی گروه‌ها\n"
     "/cooldown <دقیقه> — کول‌داون هر نفر\n"
     "/cancel — لغو عملیات نیمه‌کاره\n"
     "\nهمه‌ی تغییرها فوری اعمال می‌شوند (بدون ری‌استارت)."
@@ -401,6 +410,7 @@ class Panel:
             f"🚫 اسپم: بیشتر از {s.get('spam_message_threshold', 3)} پیام "
             f"در {s.get('spam_window_minutes', 30)} دقیقه",
             f"📣 حالت گزارش: {MODE_LABELS.get(report_mode, report_mode)}",
+            f"👥 شلوغی گروه‌ها: {GROUP_MODE_LABELS.get(str(s.get('group_report_mode', 'away')).lower(), '?')}",
             f"🕐 گزارش روزانه: {daily}",
             f"🚫 نادیده: {ignore_count} نفر | 👥 گروه‌های مجاز: {group_count}",
             f"📦 دیتابیس: پیام={stats.get('msgs', '?')} پاسخ={stats.get('replies', '?')} "
@@ -618,10 +628,12 @@ class Panel:
         daily_on = bool(s.get("daily_report_enabled", True))
         errors_on = bool(s.get("report_errors", True))
         startup_on = bool(s.get("report_startup_message", True))
+        group_mode = str(s.get("group_report_mode", "away")).lower()
         text = (
             "📈 گزارش‌ها\n"
             "─────────────\n"
             f"📣 حالت گزارش: {MODE_LABELS.get(mode, mode)}\n"
+            f"👥 شلوغی گروه‌ها: {GROUP_MODE_LABELS.get(group_mode, group_mode)}\n"
             f"🕐 گزارش روزانه: {'روشن' if daily_on else 'خاموش'} "
             f"({s.get('daily_report_time', '23:00')})\n"
             f"⚠️ گزارش خطاها: {'روشن' if errors_on else 'خاموش'}\n"
@@ -631,6 +643,13 @@ class Panel:
         )
         buttons = _rows(
             [_btn("📣 همه‌ی پیام‌ها", "pn:rep:all"), _btn("🌙 فقط وقتی آفلاین", "pn:rep:offline_only")],
+            [
+                _btn(
+                    ("✅ " if group_mode == key else "") + label,
+                    f"pn:noise:{key}",
+                )
+                for key, label in (("away", "🌙 گروه: آفلاین"), ("mentions", "📨 گروه: منشن"), ("all", "📢 گروه: همه"))
+            ],
             [
                 _btn("۲۰:۰۰", "pn:rep:time:2000"),
                 _btn("۲۲:۰۰", "pn:rep:time:2200"),
@@ -663,6 +682,15 @@ class Panel:
         if second in ("all", "offline_only"):
             label = MODE_LABELS.get(second, second)
             await self._apply(event, "report_mode", second, f"✅ حالت گزارش: {label}", "reports")
+            return
+        if second == "noise" and third in GROUP_MODE_LABELS:
+            await self._apply(
+                event,
+                "group_report_mode",
+                third,
+                f"✅ شلوغی گروه: {GROUP_MODE_LABELS[third]}",
+                "reports",
+            )
             return
         if second == "time" and third.isdigit() and len(third) == 4:
             hour, minute = int(third[:2]), int(third[2:])
@@ -748,6 +776,8 @@ class Panel:
             await self._cmd_unignore(event, argument)
         elif command == "/mode":
             await self._cmd_mode(event, argument)
+        elif command == "/group_mode":
+            await self._cmd_group_mode(event, argument)
         elif command == "/cooldown":
             await self._cmd_cooldown(event, argument)
         elif command == "/help":
@@ -838,6 +868,30 @@ class Panel:
             return
         await self._apply_command(
             event, "report_mode", mode, f"✅ حالت گزارش: {MODE_LABELS.get(mode, mode)}", "reports"
+        )
+
+    async def _cmd_group_mode(self, event, argument: str) -> None:
+        """How much of an allowed group reaches the owner."""
+        mode = argument.strip().lower()
+        if mode not in GROUP_MODE_LABELS:
+            await self._reply(
+                event,
+                "یکی را انتخاب کن:\n"
+                "• away — هر پیام گروه، ولی فقط وقتی آفلاینی\n"
+                "• mentions — فقط منشن تو یا ریپلای روی پیام تو\n"
+                "• all — هر پیام، همیشه",
+                _rows(
+                    [_btn("🌙 آفلاین", "pn:noise:away"), _btn("📨 منشن", "pn:noise:mentions")],
+                    [_btn("📢 همه", "pn:noise:all")],
+                ),
+            )
+            return
+        await self._apply_command(
+            event,
+            "group_report_mode",
+            mode,
+            f"✅ شلوغی گروه: {GROUP_MODE_LABELS[mode]}",
+            "reports",
         )
 
     async def _cmd_cooldown(self, event, argument: str) -> None:
@@ -1033,6 +1087,9 @@ class Panel:
             return
         if action == "rep":
             await self._cb_report(event, second, third)
+            return
+        if action == "noise":
+            await self._cb_report(event, "noise", second)
             return
         if action == "err" and second == "clear":
             try:

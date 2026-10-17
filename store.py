@@ -24,7 +24,7 @@ import os
 import sqlite3
 import time
 
-from paths import CONFIG_PATH, DB_PATH, HERE  # single place that decides where files live
+from paths import CONFIG_PATH, DB_PATH, OFFLINE_LOG  # single place that decides where files live
 
 # Fallback values, used when neither the database nor config.json has the key.
 DEFAULTS: dict = {
@@ -58,6 +58,11 @@ DEFAULTS: dict = {
     # a group. report_mode: "all" = every message, "offline_only" = only while
     # the owner is away (each sender is then grouped into ONE edited message).
     "report_mode": "offline_only",
+    # Notifications coming from an allowed group. "away" (default) = every message
+    # there, but only while the owner is away; "all" = every message, always;
+    # "mentions" = only a mention of the owner or a reply to one of his messages
+    # (the quiet option for a busy group).
+    "group_report_mode": "away",
     "report_private_messages": True,
     "report_errors": True,
     "report_startup_message": True,
@@ -102,7 +107,9 @@ class Store:
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated REAL)")
         c.execute("CREATE TABLE IF NOT EXISTS ignore_users (user_id INTEGER, username TEXT, label TEXT, added REAL)")
         c.execute("CREATE TABLE IF NOT EXISTS groups (chat_id INTEGER PRIMARY KEY, title TEXT, added REAL)")
-        c.execute("CREATE TABLE IF NOT EXISTS bot_msgs (msg_id INTEGER PRIMARY KEY, ts REAL)")
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS bot_msgs (msg_id INTEGER PRIMARY KEY, ts REAL, chat_id INTEGER)"
+        )
         c.execute("CREATE TABLE IF NOT EXISTS error_state (signature TEXT PRIMARY KEY, ts REAL, count INTEGER)")
         c.execute("CREATE TABLE IF NOT EXISTS traffic (sender_id INTEGER, chat_id INTEGER, ts REAL, kind TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS names (user_id INTEGER PRIMARY KEY, name TEXT, username TEXT, ts REAL)")
@@ -125,6 +132,25 @@ class Store:
         c.execute("CREATE INDEX IF NOT EXISTS idx_msgs_sender_ts ON msgs (sender_id, ts)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_replies_sender_ts ON replies (sender_id, ts)")
         c.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns a newer version needs to a database created by an older one.
+
+        CREATE TABLE IF NOT EXISTS never touches an existing table, so a column that
+        was added later has to be added here by hand.
+        """
+        try:
+            columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(bot_msgs)")}
+            if "chat_id" not in columns:
+                self.conn.execute("ALTER TABLE bot_msgs ADD COLUMN chat_id INTEGER")
+                self.conn.commit()
+        except sqlite3.Error as exc:  # a read-only or locked database must not stop the start
+            # Imported here on purpose: store.py deliberately knows nothing about the
+            # logging module at import time (tg.py pulls in telethon and .env).
+            from tg import log
+
+            log(f"store: migration skipped ({exc})")
 
     def import_config_once(self) -> bool:
         """One-time migration: config.json -> settings table (keeps v1 behaviour)."""
@@ -326,11 +352,23 @@ class Store:
         return {"day": day, "total": sum(p["n"] for p in people), "people": people}
 
     def label_for(self, sender_id: int) -> str:
-        """Best-known name for a user id: names table first, then offline.jsonl."""
+        """Best-known name for a user id: names table first, then the offline journal.
+
+        The journal lives in DATA_DIR (OFFLINE_LOG); it used to be looked up next to
+        the source files, where it never exists, so the fallback silently did
+        nothing. This method is called from the daily report, which does not guard
+        against exceptions, so it falls back to the raw id instead of raising.
+        """
+        try:
+            return self._label_for(sender_id)
+        except Exception:  # noqa: BLE001 - a name lookup must never break a report
+            return str(sender_id)
+
+    def _label_for(self, sender_id: int) -> str:
         row = self.conn.execute("SELECT name, username FROM names WHERE user_id = ?", (int(sender_id),)).fetchone()
         if row is not None:
             return f"{row['name']}" + (f" (@{row['username']})" if row["username"] else "")
-        path = os.path.join(HERE, "offline.jsonl")
+        path = OFFLINE_LOG
         if not os.path.exists(path):
             return str(sender_id)
         try:
@@ -349,19 +387,36 @@ class Store:
 
     # ----------------------------------------------------------------- sent
 
-    def remember_sent(self, msg_id: int | None) -> None:
+    def remember_sent(self, msg_id: int | None, chat_id: int | None = None) -> None:
         if msg_id is None:
             return
-        self.conn.execute("INSERT OR REPLACE INTO bot_msgs VALUES (?, ?)", (int(msg_id), time.time()))
+        self.conn.execute(
+            "INSERT OR REPLACE INTO bot_msgs (msg_id, ts, chat_id) VALUES (?, ?, ?)",
+            (int(msg_id), time.time(), int(chat_id) if chat_id is not None else None),
+        )
         self.conn.execute(
             "DELETE FROM bot_msgs WHERE msg_id NOT IN (SELECT msg_id FROM bot_msgs ORDER BY ts DESC LIMIT 500)"
         )
         self.conn.commit()
 
-    def was_sent_by_bot(self, msg_id: int | None) -> bool:
+    def was_sent_by_bot(self, msg_id: int | None, chat_id: int | None = None) -> bool:
+        """True when this message was sent by the bot itself.
+
+        Message ids come from a per-peer sequence, so the same id can belong to an
+        unrelated message in another chat. When the chat is known, only a row from
+        that chat counts (rows written before chat ids were stored keep matching:
+        they are few and age out of the 500-entry window).
+        """
         if msg_id is None:
             return False
-        return self.conn.execute("SELECT 1 FROM bot_msgs WHERE msg_id = ?", (int(msg_id),)).fetchone() is not None
+        if chat_id is None:
+            row = self.conn.execute("SELECT 1 FROM bot_msgs WHERE msg_id = ?", (int(msg_id),)).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT 1 FROM bot_msgs WHERE msg_id = ? AND (chat_id IS NULL OR chat_id = ?)",
+                (int(msg_id), int(chat_id)),
+            ).fetchone()
+        return row is not None
 
     # --------------------------------------------------------------- errors
 

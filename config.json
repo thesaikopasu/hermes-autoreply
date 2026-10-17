@@ -19,6 +19,7 @@
   "group_answers": true,
   "group_respect_presence": true,
   "report_mode": "offline_only",
+  "group_report_mode": "away",
   "report_private_messages": true,
   "report_errors": true,
   "report_startup_message": true,

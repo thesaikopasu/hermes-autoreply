@@ -10,6 +10,9 @@ Run:  python auto_reply.py               normal operation (what the Startup shor
       python auto_reply.py --daily-preview     today's report text, not sent
       python auto_reply.py --report-send       send the daily report through the control bot now
       python auto_reply.py --import-config     re-import config.json into the database
+      python auto_reply.py --behavior-check     the reviewed bugs, tested without Telegram
+      python auto_reply.py --deploy-check       the container rules Railway validates
+      python auto_reply.py --signal-check       a stop signal ends in a clean shutdown
 
 Files
 -----
@@ -34,14 +37,24 @@ from __future__ import annotations
 import asyncio
 import ast
 import os
+import signal
 import sys
 
 from bot import SESSION_PATH, Bot
 from commands import COMMAND_NAMES, EXTRA_HELP, HELP, Commands
 from reports import Reporter
 from store import Store
-from tg import REQUIRED_ENV, account_line, log, mask, open_user_client, optional_env
-from paths import DATA_DIR, DB_PATH, LOG_PATH
+from tg import (
+    REQUIRED_ENV,
+    MissingEnv,
+    account_line,
+    classify_error,
+    log,
+    mask,
+    open_user_client,
+    optional_env,
+)
+from paths import DATA_DIR, DB_PATH, LOG_PATH, OFFLINE_LOG
 
 
 # --------------------------------------------------------------------- checks
@@ -311,6 +324,198 @@ def decisions_check() -> int:
     return 1 if failures else 0
 
 
+def behavior_check() -> int:
+    """Run the reviewed-bug tests in a subprocess with a throwaway DATA_DIR.
+
+    Isolated on purpose: the cases below build a real Bot and a real database, and
+    that must never touch the live state.db, the live journal or the live session.
+    """
+    import subprocess
+    import tempfile
+
+    scratch = tempfile.mkdtemp(prefix="behavior-check-")
+    env = dict(os.environ)
+    env["DATA_DIR"] = scratch
+    env["AUTO_REPLY_SKIP_DOTENV"] = "1"  # otherwise .env would provide credentials
+    for name in ("API_ID", "API_HASH", "SESSION_STRING", "WATCHER_SESSION_STRING", "BOT_TOKEN", "OWNER_ID"):
+        env.pop(name, None)
+    for name in ("TELEGRAM_API_ID", "TELEGRAM_API_HASH"):
+        env.pop(name, None)
+    print(f"--- behaviour of the reviewed fixes (DATA_DIR={scratch}) ---")
+    result = subprocess.run(
+        [sys.executable, "auto_reply.py", "--behavior-check-inner"],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    sys.stdout.write(result.stdout)
+    if result.stderr.strip():
+        sys.stdout.write(result.stderr)
+    failures = 0 if result.returncode == 0 else 1
+
+    # A real stop signal in the same isolated environment: this is how Docker and
+    # Railway end the process, and it must still reach bot.shutdown().
+    stopped = subprocess.run(
+        [sys.executable, "auto_reply.py", "--signal-check"],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    sys.stdout.write(stopped.stdout)
+    if stopped.stderr.strip():
+        sys.stdout.write(stopped.stderr)
+    if stopped.returncode != 0 or "ok  " not in stopped.stdout:
+        failures += 1
+        print("  FAIL the stop-signal path (SIGTERM -> clean shutdown) is broken")
+    return 1 if failures else 0
+
+
+def behavior_check_inner() -> int:
+    """The cases themselves - every one of them failed before the fix."""
+    import ast as _ast
+    import inspect
+    import json as _json
+
+    print("--- behaviour of the reviewed fixes (no Telegram) ---")
+    failures = []
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        print(f"  {'ok  ' if ok else 'FAIL'} {name:<52} {detail}")
+        if not ok:
+            failures.append(name)
+
+    tree = _ast.parse(open("auto_reply.py", encoding="utf-8").read())
+    bot_tree = _ast.parse(open("bot.py", encoding="utf-8").read())
+
+    # 1) Bot.start takes no announce argument, and no call site passes one.
+    start_args = []
+    for node in _ast.walk(bot_tree):
+        if isinstance(node, _ast.AsyncFunctionDef) and node.name == "start":
+            start_args = [a.arg for a in node.args.args]
+            break
+    check("Bot.start() has no 'announce' parameter", "announce" not in start_args, f"params={start_args}")
+    callers = [
+        str(node.lineno)
+        for node in _ast.walk(tree)
+        if isinstance(node, _ast.Call) and any(k.arg == "announce" for k in node.keywords)
+    ]
+    check("no call site passes announce=", not callers, f"lines={callers}")
+
+    # 2) Startup failures are explained, not traced back.
+    names = {n.id for n in _ast.walk(tree) if isinstance(n, _ast.Name)}
+    check("auto_reply.py uses MissingEnv", "MissingEnv" in names)
+    open_bot_fn = next(
+        (n for n in _ast.walk(tree) if isinstance(n, _ast.AsyncFunctionDef) and n.name == "open_bot"), None
+    )
+    check(
+        "open_bot() honours env_check()",
+        open_bot_fn is not None and "env_check" in _ast.dump(open_bot_fn),
+    )
+    check("open_bot() catches MissingEnv", open_bot_fn is not None and "MissingEnv" in _ast.dump(open_bot_fn))
+
+    # 3) run_bot without credentials: exit code 1 and a sentence, not a traceback.
+    code = asyncio.run(run_bot(False))
+    check("run_bot() without credentials returns 1", code == 1, f"exit={code}")
+
+    store = Store()
+    settings = store.settings()
+
+    # 4) label_for reads the offline journal from DATA_DIR, not from the code dir.
+    with open(OFFLINE_LOG, "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"sender_id": 555, "name": "Kiwi", "username": "kiwi"}) + "\n")
+    label = store.label_for(555)
+    check("label_for() finds a name in DATA_DIR/offline.jsonl", "Kiwi" in label, f"label={label!r}")
+    check("label_for() falls back to the id", store.label_for(556) == "556")
+    check(
+        "store.py no longer looks next to the sources",
+        'os.path.join(HERE, "offline.jsonl")' not in open("store.py", encoding="utf-8").read(),
+    )
+
+    class FakeSender:
+        def __init__(self, uid, bot=False):
+            self.id, self.bot, self.username, self.first_name = uid, bot, None, "Kiwi"
+
+    class FakeMsg:
+        def __init__(self, text):
+            self.message, self.media, self.out = text, None, False
+            self.id, self.chat_id, self.reply_to_msg_id, self.mentioned = 1, 1, None, False
+
+    class FakeEvent:
+        def __init__(self, chat_id):
+            self.chat_id, self.is_private = chat_id, True
+
+    class FakeReporter:
+        def __init__(self):
+            self.calls = 0
+
+        async def message_report(self, **kwargs):
+            self.calls += 1
+            return True
+
+    instance = Bot()
+    instance.settings["enabled"] = False  # keeps presence out of the offline test
+    before_traffic = instance.store.stats().get("traffic", 0)
+    before_lines = sum(1 for _ in open(OFFLINE_LOG, encoding="utf-8"))
+    asyncio.run(instance.handle_private(FakeEvent(1), FakeSender(9001, bot=True), FakeMsg("hi")))
+    check(
+        "a bot message adds no traffic row",
+        instance.store.stats().get("traffic", 0) == before_traffic,
+        f"{before_traffic} -> {instance.store.stats().get('traffic')}",
+    )
+    check(
+        "a bot message adds no journal line",
+        sum(1 for _ in open(OFFLINE_LOG, encoding="utf-8")) == before_lines,
+    )
+    asyncio.run(instance.handle_private(FakeEvent(1), FakeSender(9002), FakeMsg("hi")))
+    check(
+        "a human message is still counted",
+        instance.store.stats().get("traffic", 0) == before_traffic + 1,
+        f"-> {instance.store.stats().get('traffic')}",
+    )
+
+    # 5) The status screen shows the effective verdict, not the raw reading.
+    instance.settings["offline_mode"] = "online"
+    text = asyncio.run(instance.status_text())
+    check("status shows the forced 'online' as the decision", "آنلاین (ساکت)" in text)
+    instance.settings["offline_mode"] = "presence"
+    check("status still renders with no watcher session", bool(asyncio.run(instance.status_text())))
+
+    # 6) group_report_mode decides how loud an allowed group is.
+    instance.reporter = FakeReporter()
+    instance.settings["offline_mode"] = "online"  # definitely not away
+
+    async def group_notify(mentioned):
+        return await instance.maybe_notify_group(
+            sender_id=9003, name="Kiwi", uname="kiwi", body="salam",
+            msg=FakeMsg("salam"), chat_id=-100, chat_title="g", mentioned=mentioned,
+        )
+
+    instance.settings["group_report_mode"] = "away"
+    check("group_report_mode=away stays quiet while online", asyncio.run(group_notify(True)) is False)
+    instance.settings["group_report_mode"] = "mentions"
+    before = instance.reporter.calls
+    asyncio.run(group_notify(False))
+    check("group_report_mode=mentions ignores a plain message", instance.reporter.calls == before)
+    asyncio.run(group_notify(True))
+    check("group_report_mode=mentions reports a mention", instance.reporter.calls == before + 1)
+    instance.settings["group_report_mode"] = "all"
+    asyncio.run(group_notify(False))
+    check("group_report_mode=all reports while online", instance.reporter.calls == before + 2)
+
+    # 7) was_sent_by_bot is scoped to the chat the message was sent in.
+    instance.store.remember_sent(4242, -100111)
+    check("our own message in its own chat is recognised", instance.store.was_sent_by_bot(4242, -100111) is True)
+    check("the same id in another chat is not", instance.store.was_sent_by_bot(4242, -100222) is False)
+    check("an unknown id is not", instance.store.was_sent_by_bot(4243, -100111) is False)
+    check("a legacy row (no chat id) still matches", instance.store.was_sent_by_bot(4242) is True)
+
+    instance.store.close()
+    print(f"--- {len(failures)} failure(s) ---")
+    return 1 if failures else 0
+
+
 def daily_preview() -> int:
     store = Store()
     reporter = Reporter(store, None, lambda: store.settings())
@@ -362,11 +567,110 @@ async def presence_check() -> int:
     return 0
 
 
+# Set by the signal handler, so the exit line can name what stopped us.
+_stop_signal: str | None = None
+# The loop and the event the handler wakes; None until run_bot is running.
+_loop: asyncio.AbstractEventLoop | None = None
+_stop_event: asyncio.Event | None = None
+
+
+def _install_signal_handlers(stop: asyncio.Event | None = None) -> None:
+    """Turn SIGTERM/SIGINT into a clean shutdown instead of an instant death.
+
+    In the container this process is PID 1: `docker stop`, a Railway redeploy and
+    Ctrl+C all ask it to finish, and Python's default action for SIGTERM kills the
+    process on the spot - run_bot's finally block never ran, so the sqlite
+    connection was left to the OS and Telethon was never disconnected.
+
+    The handler deliberately does *not* raise: an exception raised here surfaces in
+    whichever frame the interpreter happens to be in (usually the event loop's own
+    select(), not the bot's coroutine), which is why the first version of this fix
+    still skipped the cleanup. It only records the signal and wakes the loop, which
+    then stops the work task so the normal shutdown path runs.
+    """
+    global _stop_event
+    _stop_event = stop
+
+    def handler(signum, _frame):
+        global _stop_signal
+        try:
+            _stop_signal = signal.Signals(signum).name
+        except ValueError:
+            _stop_signal = str(signum)
+        event, loop = _stop_event, _loop
+        if event is not None and loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(event.set)
+                return
+            except RuntimeError:      # loop already gone
+                pass
+        raise KeyboardInterrupt        # nothing to wake: fall back to the default
+
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, handler)   # main thread only
+        except (ValueError, OSError, RuntimeError):
+            pass                          # not the main thread: keep the default
+
+
+async def _shutdown(bot: Bot) -> None:
+    """Close the clients and the database, even when we were interrupted.
+
+    Shielded: a cleanup that is itself awaiting something must not be abandoned
+    halfway if the surrounding task is cancelled at the same moment. The timeout
+    keeps a half-open socket from hanging the exit forever.
+    """
+    try:
+        await asyncio.shield(asyncio.wait_for(bot.shutdown(), timeout=20))
+    except asyncio.CancelledError:
+        log("shutdown was cancelled")
+    except (asyncio.TimeoutError, TimeoutError):
+        log("shutdown took longer than 20s - exiting anyway")
+    except Exception as exc:  # noqa: BLE001 - never let cleanup mask the real error
+        log(f"shutdown raised: {exc!r}")
+
+
+def startup_failure(exc: BaseException, bot: Bot) -> int:
+    """Explain why the bot could not start, in one line, instead of a traceback.
+
+    MissingEnv (no API_ID/API_HASH) and ValueError (a malformed SESSION_STRING) both
+    escaped the old code as a raw Python traceback, although the README promises a
+    clear message.
+    """
+    code, human = classify_error(exc)
+    log(f"startup failed: {code} {exc!r}")
+    print(f"\nERROR [{code}] {human}\n  {exc}\n")
+    bot.store.close()
+    return 1
+
+
+async def open_bot(quiet_env: bool = False) -> Bot | None:
+    """Connect the bot, or explain what is missing. None = it must not run."""
+    # The health log is printed first: its exit code covers the one blocking pair
+    # (API_ID/API_HASH). run_bot used to ignore it and die later on a traceback.
+    if env_check(quiet=quiet_env) != 0:
+        return None
+    bot = Bot()
+    try:
+        started = await bot.start()
+    except (MissingEnv, ValueError) as exc:
+        startup_failure(exc, bot)
+        return None
+    if not started:
+        bot.store.close()
+        return None
+    return bot
+
+
 async def report_send() -> int:
     """Send the daily report through the control bot right now."""
-    bot = Bot()
-    if not await bot.start(announce=False):
-        bot.store.close()
+    # Bot.start() takes no announce flag: passing one made --report-send fail with
+    # TypeError before it could send anything.
+    bot = await open_bot(quiet_env=True)
+    if bot is None:
         return 1
     try:
         ok = await bot.reporter.daily_report()
@@ -376,20 +680,43 @@ async def report_send() -> int:
         await bot.shutdown()
 
 
-async def run_bot(with_selftest: bool = False) -> int:
-    env_check()  # startup health log: masks secrets, explains what is missing
-    bot = Bot()
+async def run_bot(with_selftest: bool = False, make_bot=None) -> int:
+    # open_bot prints the health log (secrets masked), reports a missing API_ID /
+    # API_HASH as a sentence and returns None instead of raising on startup.
+    # make_bot is the seam --signal-check uses to run this exact path offline.
+    global _loop
+    _loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    _install_signal_handlers(stop)
+    bot = await (make_bot or open_bot)()
+    if bot is None:
+        return 1
     if not bot.settings.get("enabled", True):
         log("enabled=false in settings -> running silently (send /on in Telegram to wake it up)")
-    if not await bot.start():
-        bot.store.close()
-        return 1
     try:
-        if with_selftest:
-            return await bot.self_test()
-        return await bot.run()
+        # The work runs as a task of its own so a stop signal can end it without
+        # killing the process: the loop wakes, this coroutine resumes, and the
+        # finally below closes everything.
+        work = asyncio.create_task(bot.self_test() if with_selftest else bot.run())
+        stopper = asyncio.create_task(stop.wait())
+        try:
+            done, _pending = await asyncio.wait({work, stopper}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (work, stopper):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(work, stopper, return_exceptions=True)
+        if work in done:
+            if work.cancelled():
+                return 0
+            failure = work.exception()
+            if failure is not None:
+                raise failure
+            return int(work.result() or 0)
+        log(f"{_stop_signal or 'a stop signal'} received - shutting down")
+        return 0
     finally:
-        await bot.shutdown()
+        await _shutdown(bot)
 
 
 def tools_check(with_net: bool = False) -> int:
@@ -616,6 +943,153 @@ def tools_check(with_net: bool = False) -> int:
     return 1 if failures else 0
 
 
+async def signal_check() -> int:
+    """Prove that a stop signal ends in a clean shutdown - offline.
+
+    Runs the real run_bot path with a fake bot and raises a real SIGTERM from
+    another thread, the way a container runtime sends it, so what is tested is the
+    plumbing Docker and Railway rely on (`docker stop`, a redeploy) and not a copy.
+    """
+    import threading
+
+    events: list[str] = []
+
+    class FakeBot:
+        settings = {"enabled": True}
+
+        async def run(self):
+            events.append("running")
+            await asyncio.sleep(30)
+            events.append("finished on its own")   # the signal must arrive first
+            return 0
+
+        async def self_test(self):
+            return 0
+
+        async def shutdown(self):
+            events.append("closing")
+            await asyncio.sleep(0.05)
+            events.append("closed")
+
+    async def factory():
+        return FakeBot()
+
+    threading.Timer(0.3, signal.raise_signal, args=(signal.SIGTERM,)).start()
+    code = await run_bot(False, make_bot=factory)
+
+    print(f"  events: {', '.join(events) or '(none)'}")
+    ok = (
+        events[:3] == ["running", "closing", "closed"]
+        and "finished on its own" not in events
+        and code == 0
+    )
+    print(f"  {'ok  ' if ok else 'FAIL'} SIGTERM unwinds into a clean shutdown (exit={code})")
+    return 0 if ok else 1
+
+
+def deploy_check() -> int:
+    """Static check of the container files against the platform rules that have bitten.
+
+    Railway validates the Dockerfile *before* building and fails the whole
+    deployment on an instruction it does not implement - VOLUME being the classic,
+    and the error names a line number instead of the fix. This keeps those rules
+    testable without a Docker daemon, and it guards the two invariants that are
+    easiest to lose in an edit: nothing secret reaches the build context, and the
+    container can be stopped cleanly.
+    """
+    import fnmatch
+    import re
+
+    failures = []
+
+    def check(name: str, got, expected) -> None:
+        good = got == expected
+        print(f"  {'ok  ' if good else 'FAIL'} {name:<56} {str(got)[:34]}")
+        if not good:
+            failures.append(name)
+
+    print("--- container files against the platform rules (no daemon needed) ---")
+    try:
+        with open("Dockerfile", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        print(f"  FAIL cannot read Dockerfile: {exc}")
+        return 1
+
+    # Instruction lines only: a directive inside a comment or a string does not
+    # count, and that is the difference the first version of this check missed.
+    instructions = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            instructions.append(stripped)
+    body = "\n".join(instructions)
+
+    check("no VOLUME (Railway rejects the instruction)",
+          bool(re.search(r"(?im)^\s*VOLUME\b", body)), False)
+    check("no EXPOSE (nothing listens)", bool(re.search(r"(?im)^\s*EXPOSE\b", body)), False)
+    check("no ADD (unpacks remote archives)", bool(re.search(r"(?im)^\s*ADD\b", body)), False)
+    check("HEALTHCHECK present", "HEALTHCHECK" in body, True)
+    check("runs as a non-root user", "USER appuser" in body, True)
+    check("USER comes before CMD", body.find("USER appuser") < body.find("CMD ["), True)
+    check("never 'COPY . .' (would bake in .env / *.session)", "COPY . ." in body, False)
+    check("explicit *.py copy", "COPY --chown=appuser:appuser *.py ./" in body, True)
+    check("config.json copied", "config.json ./" in body, True)
+    check("requirements copied before the source (layer cache)",
+          text.find("COPY requirements.txt") < text.find("COPY --chown=appuser:appuser *.py"), True)
+    check("DATA_DIR default is /data", "DATA_DIR=/data" in body, True)
+    check("data dir created and owned at build time",
+          "mkdir -p /data && chown appuser:appuser /data" in body, True)
+    check("venv on PATH", 'PATH="/opt/venv/bin:$PATH"' in body, True)
+    check("libgomp1 installed (numpy/opencv wheels)", "libgomp1" in body, True)
+    check("PYTHONUNBUFFERED=1 (logs stream live)", "PYTHONUNBUFFERED=1" in body, True)
+    stages = re.findall(r"(?im)^\s*FROM\s+(\S+)", body)
+    check("base image pinned to a minor, slim tag",
+          bool(stages) and all(re.fullmatch(r"python:3\.\d+-slim", stage) for stage in stages), True)
+    check("CMD target exists in the checkout", os.path.exists("auto_reply.py"), True)
+    entrypoint = ""
+    if os.path.exists("auto_reply.py"):
+        with open("auto_reply.py", encoding="utf-8") as handle:
+            entrypoint = handle.read()
+    check("entrypoint handles SIGTERM (docker stop / redeploy)",
+          "_install_signal_handlers" in entrypoint, True)
+
+    # The build context is uploaded to the builder, and "COPY *.py ./" copies
+    # whatever *.py it contains - so a local helper script that is not ignored
+    # ends up inside the published image.
+    try:
+        with open(".dockerignore", encoding="utf-8") as handle:
+            ignore = handle.read()
+    except OSError:
+        ignore = ""
+    patterns = [ln.strip() for ln in ignore.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+    def ignored(name: str) -> bool:
+        """Docker's matching, close enough: the last matching pattern wins."""
+        verdict = False
+        for pattern in patterns:
+            negate = pattern.startswith("!")
+            pat = pattern.lstrip("!").rstrip("/")
+            if (fnmatch.fnmatch(name, pat)
+                    or fnmatch.fnmatch(name, pat + "/*")
+                    or name.split("/")[0] == pat):
+                verdict = not negate
+        return verdict
+
+    check(".dockerignore exists", bool(patterns), True)
+    for secret in (".env", "config.local.json", "auto_reply_session.session", "state.db",
+                   "data/state.db", "offline.jsonl", "auto_reply.log", "pause.flag",
+                   "prep_env.py", "login.py", "net_probe.py", ".git/config",
+                   "__pycache__/paths.cpython-312.pyc"):
+        check(f"kept out of the build context: {secret}", ignored(secret), True)
+    for needed in ("requirements.txt", "auto_reply.py", "bot.py", "config.json",
+                   "generate_session.py", ".env.example"):
+        check(f"still sent to the builder: {needed}", ignored(needed), False)
+
+    print(f"--- {len(failures)} failure(s) ---")
+    return 1 if failures else 0
+
+
 def main(argv: list[str]) -> int:
     if "--env-check" in argv:
         return env_check()
@@ -625,6 +1099,14 @@ def main(argv: list[str]) -> int:
         return commands_check()
     if "--tools-check" in argv:
         return tools_check("--net" in argv)
+    if "--deploy-check" in argv:
+        return deploy_check()
+    if "--behavior-check" in argv:
+        return behavior_check()
+    if "--signal-check" in argv:
+        return asyncio.run(signal_check())
+    if "--behavior-check-inner" in argv:
+        return behavior_check_inner()
     if "--test-decisions" in argv:
         return decisions_check()
     if "--daily-preview" in argv:
@@ -648,4 +1130,4 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
     except KeyboardInterrupt:
-        log("stopped by Ctrl+C")
+        log(f"stopped by {_stop_signal or 'Ctrl+C'} - clean shutdown")

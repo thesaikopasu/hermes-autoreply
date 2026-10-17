@@ -202,7 +202,7 @@ class Bot:
             self.owner, peer, text, timer=self.timer, on_error=self.reporter.error, label=label
         )
         if msg is not None:
-            self.store.remember_sent(getattr(msg, "id", None))
+            self.store.remember_sent(getattr(msg, "id", None), getattr(msg, "chat_id", None))
         return msg
 
     async def send_to(self, peer, text: str):
@@ -291,6 +291,7 @@ class Bot:
             log(f"admins: {sorted(self.admins)}")
         self.timer.attach(self.owner)
         await self.load_contacts()
+        await self.warm_entity_cache()
         # The watcher reads the status of THIS account (an account cannot see its
         # own status), so tell it who to watch instead of hard-coding a username.
         self.watcher.set_target(me.id)
@@ -330,6 +331,20 @@ class Bot:
             except Exception as exc:  # noqa: BLE001
                 log(f"presence heartbeat failed: {exc!r}")
 
+
+    async def warm_entity_cache(self) -> None:
+        """Read the dialog list once so old peers stay reachable after a restart.
+
+        A StringSession carries the auth key, not the entity cache Telethon builds
+        while it is used. Without this, answering someone from a notification the
+        bot sent before the restart failed with "Could not find the input entity".
+        """
+        started = time.time()
+        try:
+            dialogs = await self.owner.get_dialogs(limit=None)
+            log(f"entity cache warmed: {len(dialogs)} dialogs in {time.time() - started:.1f}s")
+        except Exception as exc:  # noqa: BLE001 - a warm cache is a comfort, not a need
+            log(f"could not warm the entity cache: {exc!r}")
 
     async def load_contacts(self) -> None:
         try:
@@ -407,7 +422,7 @@ class Bot:
         try:
             msg = event.message
             text = msg.message or ""
-            if self.store.was_sent_by_bot(getattr(msg, "id", None)):
+            if self.store.was_sent_by_bot(getattr(msg, "id", None), getattr(msg, "chat_id", None)):
                 return  # our own message: it must not count as owner activity
             # A real message from one of the owner's clients (phone/PC/web) is the
             # strongest "he is here" signal we have, and it works on a server too.
@@ -441,6 +456,14 @@ class Bot:
         is_owner = sender.id == self.owner_id
         is_service = sender.id in SERVICE_IDS
         is_bot = bool(getattr(sender, "bot", False))
+
+        # The control bot talks to the owner through this very account, so every
+        # notification it sends arrives here as an ordinary incoming message.
+        # Recording it would inflate the counters, fill the offline journal with the
+        # bot's own text and - while the owner is away - notify him about a
+        # notification. ignore_bots is the switch for this and is on by default.
+        if is_bot and s.get("ignore_bots", True):
+            return
 
         if not (is_self or is_owner or is_service):
             self.store.remember_name(sender.id, name, uname)
@@ -552,6 +575,17 @@ class Bot:
             sender, name, uname, body, template, warn=(action == SPAM), why=reason
         )
 
+    async def _is_reply_to_owner(self, msg) -> bool:
+        """True when this message is a reply to one of the owner's own messages."""
+        if not getattr(msg, "reply_to_msg_id", None):
+            return False
+        try:
+            original = await msg.get_reply_message()
+        except Exception as exc:  # noqa: BLE001
+            log(f"could not read the replied message: {exc!r}")
+            return False
+        return bool(original and original.sender_id == self.owner_id)
+
     async def maybe_notify_private(
         self, *, sender_id: int, name: str, uname: str | None, body: str, msg, ignored: bool, away_hint
     ) -> bool:
@@ -588,13 +622,24 @@ class Bot:
             log(f"notification failed for sender={sender_id}: {exc!r}")
             return False
 
-    async def maybe_notify_group(self, *, sender_id: int, name: str, uname: str | None, body: str, msg, chat_id: int, chat_title: str | None) -> bool:
-        """Same, for a message in an allowed group."""
+    async def maybe_notify_group(
+        self, *, sender_id: int, name: str, uname: str | None, body: str, msg,
+        chat_id: int, chat_title: str | None, mentioned: bool = False,
+    ) -> bool:
+        """Same, for a message in an allowed group.
+
+        group_report_mode decides how loud a group is: "away" (every message there,
+        but only while the owner is away), "all" (every message, always) or
+        "mentions" (only a mention of the owner or a reply to one of his messages).
+        """
         s = self.settings
         if sender_id == self.owner_id:
             return False
-        mode = str(s.get("report_mode", "offline_only"))
-        if mode != "all":
+        group_mode = str(s.get("group_report_mode", "away")).lower()
+        if group_mode == "mentions":
+            if not mentioned and not await self._is_reply_to_owner(msg):
+                return False
+        elif group_mode != "all":
             away_now, _ = await self.is_away()
             if not away_now:
                 return False
@@ -637,6 +682,11 @@ class Bot:
 
         body = msg.message or ""
         chat_title = getattr(event.chat, "title", None)
+        # A mention is free (it is a flag on the message); the reply lookup costs an
+        # API call, so it only happens when the answer can change something.
+        mentioned = bool(getattr(msg, "mentioned", False))
+        if not mentioned and self.owner_username:
+            mentioned = f"@{self.owner_username.lower()}" in body.lower()
         await self.maybe_notify_group(
             sender_id=sender.id,
             name=name,
@@ -645,17 +695,9 @@ class Bot:
             msg=msg,
             chat_id=event.chat_id,
             chat_title=chat_title,
+            mentioned=mentioned,
         )
-        mentioned = bool(getattr(msg, "mentioned", False))
-        if not mentioned and self.owner_username:
-            mentioned = f"@{self.owner_username.lower()}" in body.lower()
-        replied_to_me = False
-        if msg.reply_to_msg_id:
-            try:
-                original = await msg.get_reply_message()
-                replied_to_me = bool(original and original.sender_id == self.owner_id)
-            except Exception as exc:  # noqa: BLE001
-                log(f"could not read the replied message: {exc!r}")
+        replied_to_me = await self._is_reply_to_owner(msg)
         if not (mentioned or replied_to_me):
             return
 
@@ -798,15 +840,30 @@ class Bot:
 
     async def status_text(self) -> str:
         s = self.settings
-        away, why = await self.watcher.verdict()
+        # The effective verdict is what is_away() decides, not the raw status: a
+        # manual online/offline, a reply of the owner minutes ago or the idle
+        # fallback all change the outcome, and the panel used to show the raw
+        # reading instead (so a forced mode looked like the opposite of reality).
+        away, why = await self.is_away()
+        try:
+            raw_away, raw_why = await self.watcher.verdict()
+        except Exception as exc:  # noqa: BLE001 - the status screen must still render
+            raw_away, raw_why = None, f"unavailable ({exc!r})"
         up = int(time.time() - self.started_at)
         tables = self.store.stats()
         presence = {True: "آفلاین (جواب می‌ده)", False: "آنلاین (ساکت)", None: "نامعلوم"}[away]
+        raw_presence = {True: "آفلاین", False: "آنلاین", None: "نامعلوم"}[raw_away]
         lines = [
             ("🟢 ربات روشن است" if s.get("enabled", True) else "⛔️ ربات خاموش است")
             + ("   • pause.flag فعال" if self.paused() else ""),
             f"🧠 تشخیص: {s.get('offline_mode')} — کاربر 乂 الان: {presence}",
             f"🔎 دلیل: {why}",
+        ]
+        if raw_away != away:
+            # Only worth a line when the two disagree (forced mode, recent activity,
+            # idle fallback): the raw status is a measurement, not the decision.
+            lines.append(f"📡 حضور خام (اندازه‌گیری): {raw_presence} — {raw_why}")
+        lines += [
             f"⏱ خاموش‌شدن خودکار: {self.timer.delay:.0f} ثانیه (تا حالا {self.timer.offline_count} بار)",
             f"🔁 کول‌داون هر نفر: {s.get('cooldown_minutes')} دقیقه",
             f"🚫 اسپم: بیشتر از {s.get('spam_message_threshold')} پیام در {s.get('spam_window_minutes')} دقیقه",
@@ -817,6 +874,7 @@ class Bot:
             f"گروه: {self.counters['group']} | ساکت: {self.counters['silent']}",
             f"🤖 بات کنترل: {'🟢 وصل' if getattr(self.notifier, 'client', None) else '🔴 وصل نشده'}"
             f"  |  📨 حالت گزارش: {s.get('report_mode') or 'offline_only'}",
+            f"  |  👥 شلوغی گروه: {s.get('group_report_mode', 'away')}",
             f"🕐 گزارش روزانه: {s.get('daily_report_time') if s.get('daily_report_enabled', True) else 'خاموش'}",
             f"🗄 دیتابیس: msgs={tables['msgs']} replies={tables['replies']} traffic={tables['traffic']}",
             f"⏳ آپ‌تایم: {up // 3600} ساعت و {(up % 3600) // 60} دقیقه",

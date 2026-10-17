@@ -74,10 +74,16 @@ def presence_verdict(status, grace_seconds: float) -> tuple[bool | None, str]:
         return True, f"owner offline, last seen {int(delta / 60)}m ago"
     if status is None or isinstance(status, UserStatusEmpty):
         return None, "no status visible (privacy setting?)"
-    if isinstance(status, UserStatusRecently):
-        return True, "last seen recently (coarse status)"
-    if isinstance(status, (UserStatusLastWeek, UserStatusLastMonth)):
-        return True, f"last seen {type(status).__name__}"
+    if isinstance(status, (UserStatusRecently, UserStatusLastWeek, UserStatusLastMonth)):
+        # A coarse status is what Telegram shows when the watcher account is not
+        # allowed to see the exact last-seen time. That is a privacy setting, not a
+        # measurement: while it is coarse, an actually-online owner also reads as
+        # "recently", so the bot would answer as if he were away. The hint is here
+        # because the fix is in Telegram, not in this file (README, "Presence").
+        return True, (
+            f"{type(status).__name__} - coarse status, the watcher account cannot see "
+            "the exact time (add it in Settings > Privacy > Last Seen to get a real reading)"
+        )
     return None, f"unknown status {type(status).__name__}"
 
 

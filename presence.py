@@ -118,6 +118,9 @@ class Watcher:
         self.target_env = optional_env("PRESENCE_TARGET")
         self.target_name = self.target_env or (self.cfg.get("target") or "").strip()
         self.grace = float(self.cfg.get("grace_seconds", 10))
+        # How long to wait before the second look at an "online" reading.
+        self.confirm_seconds = float(self.cfg.get("confirm_seconds", 4))
+        self.self_id: int | None = None
         self.client: TelegramClient | None = None
 
     def set_target(self, value: str | int) -> None:
@@ -139,23 +142,48 @@ class Watcher:
 
     async def _line(self) -> str:
         me = await self.client.get_me()
+        self.self_id = me.id  # so we can refuse to read our own status
         return f"watcher: id={me.id} @{me.username}"
 
-    async def _resolve_target(self):
-        """Find the watched account in the most forgiving way possible.
+    def _is_wanted(self, peer, wanted: str) -> bool:
+        """True only for the account we are supposed to watch.
 
-        1. the configured target (username, phone, id or "me")
-        2. a dialog scan when the id is not resolvable directly (a brand-new
-           server has no cached peer for another account's numeric id)
+        The watcher account is always online while it is connected, so reading its
+        own status by mistake would report "the owner is online" forever. Every
+        candidate therefore has to prove it is the right person.
         """
-        candidates = [c for c in (self.target_name, "me") if c]
-        for candidate in candidates:
-            try:
-                return await self.client.get_entity(candidate)
-            except Exception:  # noqa: BLE001
-                continue
+        peer_id = getattr(peer, "id", None)
+        if peer_id is None:
+            return False
+        if self.self_id and peer_id == self.self_id:
+            log("watcher: resolved our own account - refusing to read it as the owner")
+            return False
+        return not wanted.isdigit() or peer_id == int(wanted)
+
+    async def _resolve_target(self):
+        """Find the watched account, trying hard but never guessing.
+
+        1. the configured target exactly as written (username, phone or id)
+        2. the same target as a number (the session may already know the peer)
+        3. a dialog scan - a brand-new server has no cached peer for another
+           account's numeric id yet
+        """
         wanted = str(self.target_name).lstrip("-")
+        if self.target_name:
+            try:
+                peer = await self.client.get_entity(self.target_name)
+                if self._is_wanted(peer, wanted):
+                    return peer
+                log(f"watcher: target {self.target_name!r} resolved to another id")
+            except Exception:  # noqa: BLE001
+                pass
         if wanted.isdigit():
+            try:
+                peer = await self.client.get_entity(int(wanted))
+                if self._is_wanted(peer, wanted):
+                    return peer
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 async for dialog in self.client.iter_dialogs(limit=300):
                     entity = dialog.entity
@@ -165,9 +193,8 @@ class Watcher:
                 log(f"watcher: dialog scan failed {exc!r}")
         return None
 
-    async def verdict(self) -> tuple[bool | None, str]:
-        if not self.enabled:
-            return None, "presence disabled in settings"
+    async def _read_once(self) -> tuple[bool | None, str]:
+        """One status lookup. Returns (away, why) with away=None when unknown."""
         try:
             if self.client is None or not self.client.is_connected():
                 log("watcher: reconnecting...")
@@ -175,18 +202,43 @@ class Watcher:
                     return None, "watcher session unavailable"
             if not self.target_name:
                 return None, "no presence target known yet"
-            fresh = await self._resolve_target()
-            if fresh is None:
+            peer = await self._resolve_target()
+            if peer is None:
                 return None, "presence target not resolvable from the watcher account"
+            # Always refresh from the server. Falling back to the locally cached
+            # entity would use a status from whenever it was cached (often "online"
+            # from our own login), which is how a wrong "owner is here" appears.
             try:
-                full = await self.client(GetFullUserRequest(fresh))
-                if full.users:
-                    fresh = full.users[0]
-            except Exception:  # noqa: BLE001
-                pass
-            return presence_verdict(getattr(fresh, "status", None), self.grace)
+                full = await self.client(GetFullUserRequest(peer))
+            except Exception as exc:  # noqa: BLE001
+                return None, f"presence refresh failed: {exc!r}"
+            if not full.users:
+                return None, "the server returned no user record for the target"
+            return presence_verdict(getattr(full.users[0], "status", None), self.grace)
         except Exception as exc:  # noqa: BLE001
             return None, f"presence lookup failed: {exc!r}"
+
+    async def verdict(self, confirm: bool = True) -> tuple[bool | None, str]:
+        """away=True -> not online, an auto-reply may go out.
+
+        A single reading that says "online" is not enough: Telegram reports an
+        account as online for a moment after it logs in or sends something, so a
+        blip would silence the bot exactly when it should answer. An "online"
+        reading therefore gets a second look a few seconds later, and if the two
+        disagree the answer is None (= unknown) so the caller can fall back to the
+        PC-idle heuristic instead of trusting a coin flip.
+        """
+        if not self.enabled:
+            return None, "presence disabled in settings"
+        away, why = await self._read_once()
+        if away is not False or not confirm:
+            return away, why
+        await asyncio.sleep(self.confirm_seconds)
+        away2, why2 = await self._read_once()
+        if away2 is False:
+            return away2, why2
+        log(f"watcher: 'online' was a blip ({why}) - second look: {why2}")
+        return away2, why2
 
     async def stop(self) -> None:
         if self.client is not None:

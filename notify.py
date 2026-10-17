@@ -438,9 +438,14 @@ class Notifier:
                     buttons=self.buttons_for(sender, buttons),
                 )
             except Exception as exc:  # noqa: BLE001
+                code, human = classify_code(exc)
+                if "not modified" in str(human).lower() or "NOT_MODIFIED" in str(code).upper():
+                    entry["count"] = count
+                    _log(f"notify: notification of {mask(sender)} was already current (count {count})")
+                    return True
                 _log(
                     f"notify: editing the open notification of {mask(sender)} failed "
-                    f"({classify_code(exc)[0]}) - sending a fresh one"
+                    f"({code} {human}) - sending a fresh one"
                 )
                 self.open_notifications.pop(sender, None)
             else:

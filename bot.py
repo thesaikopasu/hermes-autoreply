@@ -56,6 +56,7 @@ SERVICE_IDS = {777000, 1087968824, 136817688, 1108505692}
 TEST_MARKER = "SELF-TEST ping (ignore me)"
 TEST_FLOOD_MARKER = "SELF-TEST flood (ignore me)"
 TEST_WAIT_SECONDS = 30
+PRESENCE_CACHE_SECONDS = 5.0  # reuse a presence verdict for this long
 
 IGNORE, SILENT, REPLY, SPAM = "ignore", "silent", "reply", "spam"
 
@@ -154,6 +155,9 @@ class Bot:
         self.panel = Panel(self.store, self.notifier, self.status_text, self.reply_as_owner)
         self.commands = Commands(self)
         self.last_activity = 0.0  # 0 = the owner has not sent anything since startup
+        self.forced_away = False  # the self-test can pretend the owner is away
+        self._away_cache: tuple[float, bool, str] | None = None
+        self._sender_locks: dict[int, asyncio.Lock] = {}
         self.contacts: set[int] = set()
         self.known_history: set[int] = set()
         self.tasks: list[asyncio.Task] = []
@@ -323,19 +327,45 @@ class Bot:
     async def on_incoming(self, event) -> None:
         try:
             msg = event.message
-            if msg is None or self.store.was_sent_by_bot(getattr(msg, "id", None)):
+            if msg is None:
+                return
+            # Our own messages are never answered. Telethon's own "outgoing" flag is
+            # the reliable test here: message ids come from each sender's own
+            # sequence, so the id registry (bot_msgs) can match a stranger's message
+            # that merely happens to reuse an id - and such a message was dropped
+            # without a trace.
+            if bool(getattr(msg, "out", False)):
                 return
             sender = await event.get_sender()
             if not isinstance(sender, User):
                 sender = None
             if event.is_private:
-                await self.handle_private(event, sender, msg)
+                # One message at a time per sender. Handlers run concurrently, so
+                # without this a burst arriving inside the same second was judged
+                # against the same counters and answered once per message (the spam
+                # warning went out three times instead of once).
+                async with self.sender_lock(sender.id if sender is not None else 0):
+                    await self.handle_private(event, sender, msg)
             else:
                 await self.handle_group(event, sender, msg)
         except Exception as exc:  # noqa: BLE001
             code, human = classify_error(exc)
             log(f"handler error: {code} {exc!r}")
             await self.reporter.error(code, human)
+
+    def sender_lock(self, sender_id: int) -> asyncio.Lock:
+        """A per-sender lock, so one person's messages are judged one after another.
+
+        The decision (counts, cooldown, spam window) only makes sense if the
+        previous message from that person is fully handled - including the reply
+        and its bookkeeping - before the next one is looked at.
+        """
+        lock = self._sender_locks.get(sender_id)
+        if lock is None:
+            if len(self._sender_locks) > 500:  # keep the table small
+                self._sender_locks.clear()
+            lock = self._sender_locks[sender_id] = asyncio.Lock()
+        return lock
 
     async def on_outgoing(self, event) -> None:
         """Owner activity + admin commands (Saved Messages, DM, report group)."""
@@ -655,6 +685,8 @@ class Bot:
         return False
 
     async def is_away(self) -> tuple[bool, str]:
+        if self.forced_away:
+            return True, "forced away for the self-test"
         # 0) the control panel can force the answer: "online" = never auto-reply,
         #    "offline" = always act as if the owner is away.
         mode = str(self.settings.get("offline_mode", "presence"))
@@ -669,10 +701,16 @@ class Bot:
             return False, f"owner sent a message {int((time.time() - self.last_activity) / 60)}m ago"
         if mode == "idle":
             return idle_verdict(self.settings, self.last_activity)
+        # A presence verdict costs two API calls, so a fresh one is reused: during a
+        # burst of messages the answer cannot have changed inside a few seconds.
+        cache = self._away_cache
+        if cache is not None and (time.time() - cache[0]) < PRESENCE_CACHE_SECONDS:
+            return cache[1], cache[2]
         away, why = await self.watcher.verdict()
         if away is None:
             fallback_away, fallback_why = idle_verdict(self.settings, self.last_activity)
             return fallback_away, f"fallback ({fallback_why})"
+        self._away_cache = (time.time(), away, why)
         return away, why
 
     # ------------------------------------------------------------- lifecycle
@@ -752,10 +790,24 @@ class Bot:
 
     # ------------------------------------------------------------- self test
 
+    async def _chat_cursor(self, peer_id: int) -> int:
+        """Newest message id in a chat, so the test only ever accepts NEW answers.
+
+        Without this the spam phase could pass on the warning left in the chat by an
+        earlier run, which hides a broken spam rule instead of catching it.
+        """
+        newest = 0
+        try:
+            async for m in self.watcher.client.iter_messages(peer_id, limit=1):
+                newest = m.id
+        except Exception as exc:  # noqa: BLE001
+            log(f"self-test: could not read the chat cursor: {exc!r}")
+        return newest
+
     async def _wait_for_incoming(
-        self, peer_id: int, needle: str, timeout: float = TEST_WAIT_SECONDS
+        self, peer_id: int, needle: str, since: int = 0, timeout: float = TEST_WAIT_SECONDS
     ) -> tuple[str | None, float]:
-        """Read the chat as the watcher and return the first answer containing `needle`."""
+        """Read the chat as the watcher and return the first new answer with `needle`."""
         waited = 0.0
         while waited < timeout:
             await asyncio.sleep(2)
@@ -763,7 +815,7 @@ class Bot:
             try:
                 async for m in self.watcher.client.iter_messages(peer_id, limit=10):
                     text = m.message or ""
-                    if m.out or not text:
+                    if m.out or not text or m.id <= since:
                         continue
                     if TEST_MARKER in text or TEST_FLOOD_MARKER in text:
                         continue
@@ -793,7 +845,7 @@ class Bot:
         # Presence needs to settle first: right after connecting, the account looks
         # online for a few seconds and the bot is (correctly) silent during that.
         away, why, waited_away = False, "", 0
-        while waited_away < 60:
+        while waited_away < 20:
             away, why = await self.is_away()
             log(f"self-test: presence says away={away} ({why})")
             if away:
@@ -803,17 +855,21 @@ class Bot:
         print(f"presence                    : away={away} ({why})")
 
         if not away:
-            print("VERDICT: SKIPPED - the owner looks online right now, so the bot stays")
-            print("         silent on purpose. Run it again while you are away.")
-            return 3
+            # The reply timing is what this test is about (spam rule, cooldown, report,
+            # offline timer), so from here on it acts as if the owner is away. Without
+            # this the test could only ever be run while Telegram really is closed.
+            self.forced_away = True
+            print("presence says online -> forcing away for the rest of the test")
+            print("         (logged as: forced away for the self-test)")
 
         report_before = await self._control_bot_ids()
         # A repeatable test needs a clean slate: clear this test account's message,
         # cooldown and warning history so phase 1 really starts from "first message".
         self.store.reset_sender_window(watcher_me.id)
         log(f"self-test: cleared the history of the test account {watcher_me.id} for a clean run")
+        cursor = await self._chat_cursor(owner_me.id)
         await self.watcher.client.send_message(owner_me.id, TEST_MARKER)
-        reply_text, waited = await self._wait_for_incoming(owner_me.id, "Hermes")
+        reply_text, waited = await self._wait_for_incoming(owner_me.id, "Hermes", since=cursor)
         print(f"auto-reply in the chat      : {'YES' if reply_text else 'NO'}  (after {waited:.0f}s)")
         if reply_text:
             print("reply text                  : " + reply_text.replace("\n", " ")[:160])
@@ -824,10 +880,13 @@ class Bot:
             flood_need *= max(1, int(s.get("spam_known_multiplier", 2)))
         print(f"sending {flood_need} more messages to trigger the spam rule "
               f"(limit {flood_need} in {s.get('spam_window_minutes')}m)")
+        cursor = await self._chat_cursor(owner_me.id)
         for _ in range(flood_need):
             await self.watcher.client.send_message(owner_me.id, TEST_FLOOD_MARKER)
             await asyncio.sleep(0.6)
-        spam_text, spam_waited = await self._wait_for_incoming(owner_me.id, "اسپم")
+        spam_text, spam_waited = await self._wait_for_incoming(
+            owner_me.id, "اسپم", since=cursor
+        )
         print(f"spam warning in the chat    : {'YES' if spam_text else 'NO'}  (after {spam_waited:.0f}s)")
         if spam_text:
             print("spam text                   : " + spam_text.replace("\n", " ")[:160])

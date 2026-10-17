@@ -2,6 +2,8 @@
 
 A personal Telegram assistant that answers your private messages on your behalf while you are away. It runs on **your own human account** (a userbot — not a bot account), watches whether you are really online, and replies with a short "I'm not here right now" message only when you actually are away. Everything that happens is reported to a **control bot** you create with @BotFather: that private chat is your control panel and your notification feed, with inline buttons to ignore a person, answer them yourself, or mark their message as read.
 
+**🇮🇷 فارسی: [readme_fa.md](readme_fa.md)**
+
 **Features**
 
 - Auto-replies from your own account, so people see a normal reply from you, not from a bot.
@@ -87,12 +89,12 @@ At startup the process prints a health line, for example:
 2026-01-01 12:00:00  === auto-reply bot v2 starting ===
 2026-01-01 12:00:01  owner: id=123456789 @yourname name='You'
 2026-01-01 12:00:02  notify: control bot ready (owner 1234***789)
-2026-01-01 12:00:02  config: enabled=True mode=presence delay=5s cooldown=10m spam>3/30m report_group=None daily=23:00
+2026-01-01 12:00:02  config: enabled=True mode=presence delay=5s cooldown=10m spam>3/30m report=offline_only daily=23:00 control_bot=ok
 ```
 
 If the control bot cannot reach you, the log says so in one line and the userbot keeps running: open the bot in Telegram and press /start once.
 
-Useful checks that need no Telegram connection: `python auto_reply.py --db-check`, `--commands-check`, `--test-decisions`, `--daily-preview`. With credentials in place, `--presence-check` shows which accounts connect and whether you currently count as away.
+Useful checks that need no Telegram connection: `python auto_reply.py --env-check`, `--db-check`, `--commands-check`, `--test-decisions`, `--daily-preview`. With credentials in place, `--presence-check` shows which accounts connect and whether you currently count as away, and `--self-test` exercises the whole reply pipeline.
 
 ## Environment variables
 

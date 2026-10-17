@@ -1,0 +1,48 @@
+# Secrets - the real .env never enters the repository
+.env
+.env.*
+!.env.example
+
+# Telegram session files are full account credentials
+*.session
+*.session-journal
+*.session-wal
+
+# Runtime data (sqlite database, logs, journal, pause flag) - lives in DATA_DIR
+data/
+*.db
+*.db-journal
+*.db-wal
+*.sqlite3
+*.log
+*.jsonl
+pause.flag
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local helpers and scratch files that must never be published
+prep_env.py
+claim_bot.py
+list_bots.py
+login*.py
+login*.cmd
+whoami.py
+net_probe.py
+run_forever.cmd
+run_hidden.vbs
+start.cmd
+pause.cmd
+resume.cmd
+status.cmd
+supervisor.log
+archive/

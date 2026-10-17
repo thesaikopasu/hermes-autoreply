@@ -1,0 +1,48 @@
+# systemd unit for a plain Linux VPS.
+#
+#   sudo cp deploy/hermes.service /etc/systemd/system/hermes.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hermes
+#   journalctl -u hermes -f
+#
+# Layout assumed here (edit the paths if you use another one):
+#   code + virtualenv : /opt/hermes
+#   environment file  : /opt/hermes/.env   (mode 600, owned by the service user)
+#   runtime data      : /opt/hermes/data   (DATA_DIR)
+#
+# This unit opens no network port: the process only dials out to Telegram.
+# Keep ReadWritePaths in sync with DATA_DIR.
+
+[Unit]
+Description=Telegram auto-reply userbot
+Documentation=https://github.com/your-user/your-repo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/opt/hermes
+EnvironmentFile=/opt/hermes/.env
+ExecStart=/usr/bin/python3 auto_reply.py
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-autoreply
+
+# Hardening: the service only needs to write inside DATA_DIR.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/hermes/data
+
+[Install]
+WantedBy=multi-user.target

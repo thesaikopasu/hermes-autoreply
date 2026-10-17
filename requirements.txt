@@ -1,0 +1,6 @@
+# Pinned runtime dependencies (Python 3.10+; the Docker image uses 3.12-slim).
+# Install with: pip install -r requirements.txt
+telethon==1.45.0
+python-dotenv==1.1.1
+python-socks[asyncio]==2.7.2
+cryptg==0.5.0

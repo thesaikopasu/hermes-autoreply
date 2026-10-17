@@ -80,7 +80,88 @@ COMMAND_NAMES = [
     "group_list",
     "report_now",
     "errors_clear",
+    # --- feature packs (commands.py only routes them; the code lives in
+    # features.py / games.py / webtools.py, one cmd_<name> method each)
+    "bioclock",
+    "biofont",
+    "biotemplate",
+    "autoread",
+    "replymode",
+    "lang",
+    "alerts",
+    "mention",
+    "font",
+    "prefix",
+    "tr",
+    "quick",
+    "quickprefix",
+    "fwd",
+    "tools",
+    "watchprof",
+    "alwaysonline",
+    "copyprof",
+    "whois",
+    "findnum",
+    "qr",
+    "qrscan",
+    "calc",
+    "plot",
+    "solve",
+    "time",
+    "weather",
+    "wiki",
+    "loc",
+    "fun",
+    "rps",
+    "dooz",
+    "word",
+    "hokm",
+    "play",
 ]
+
+# Help for the feature packs, printed after the core help.
+EXTRA_HELP = (
+    "─────────────\n"
+    "🧩 قابلیت‌های پیام و پروفایل\n"
+    "bioclock <قالب> — رسمی‌کردن بیو ({time} = ساعت)\n"
+    "biofont — فونت بیو (بولد/ایتالیک/…)\n"
+    "biotemplate <قالب> — قالب بیو\n"
+    "autoread on|off — خواندن خودکار پیام‌ها\n"
+    "replymode <all|offline|never> — چه وقت جواب بدهم\n"
+    "alerts on|off — هشدار ورود/خروج\n"
+    "mention <@یوزر> — منشن بدون تایپ\n"
+    "font <b|i|u|s|mono|caps|small> <متن> — تغییر شکل متن\n"
+    "prefix <متن> — پیشوند پاسخ‌ها\n"
+    "tr <فارسی|انگلیسی> — تبدیل کیبورد\n"
+    "quick add|del|list — پاسخ سریع (/quick <کلید>)\n"
+    "quickprefix on|off — پاسخ سریع با نقطه\n"
+    "fwd save|go|list|del — ذخیره و ارسال پیام\n"
+    "tools — فهرست کامل قابلیت‌ها\n"
+    "watchprof on|off — خبر تغییر پروفایل مخاطبین\n"
+    "alwaysonline on|off — آنلاین ماندن\n"
+    "copyprof <@یوزر> — کپی پروفایل\n"
+    "whois <@یوزر|آیدی> — مشخصات کاربر\n"
+    "findnum <آیدی> — پیدا کردن پیام‌های یک نفر\n"
+    "─────────────\n"
+    "🧰 ابزار\n"
+    "qr <متن> — ساخت QR\n"
+    "qrscan — خواندن QR از عکس (ریپلای)\n"
+    "calc <عبارت> — ماشین‌حساب\n"
+    "plot <تابع> [از] [تا] — نمودار\n"
+    "solve <معادله> — حل معادله\n"
+    "time <شهر> — ساعت شهرها\n"
+    "weather <شهر> — آب‌وهوا\n"
+    "wiki <موضوع> — ویکی‌پدیا\n"
+    "─────────────\n"
+    "🎲 سرگرمی و بازی\n"
+    "loc <شهر|lat,lon> [دقیقه] — لوکیشن زنده\n"
+    "fun — ۱۰ بازی کوچک (/fun 1 … /fun 10)\n"
+    "rps سنگ|کاغذ|قیچی — با امتیاز\n"
+    "dooz new | dooz <1-9> — دوز\n"
+    "word new | word <حرف> — حدس کلمه\n"
+    "hokm start | hokm <خشت|دل|گشنیز|پیك> — حکم ساده\n"
+    "play <شماره> — بازی کارت در حکم"
+)
 
 
 class Commands:
@@ -105,10 +186,45 @@ class Commands:
         return name, parts[1:]
 
     async def reply(self, event, text: str) -> None:
-        await self.bot.send(event.chat_id, text)
+        await self.bot.reply_to(event, text)
 
     def _store(self):
         return self.bot.store
+
+    async def run_extra(self, event, text: str) -> bool:
+        """Run one of the feature-pack commands; True if there was such a command.
+
+        The control-bot panel has its own short command set, so it calls this for
+        anything it does not recognise: /qr, /plot, /dooz and the rest then work
+        from that chat too, answered by the same handlers the userbot uses.
+        """
+        if not self.looks_like_command(text):
+            return False
+        name, args = self.parse(text)
+        handler = getattr(self, f"cmd_{name}", None) or self._extra_handler(name)
+        if handler is None:
+            return False
+        try:
+            await handler(event, args)
+        except Exception as exc:  # noqa: BLE001
+            log(f"command /{name} failed: {exc!r}")
+            await self.reply(event, f"⚠️ خطا در اجرای /{name}:\n{exc!r}")
+        return True
+
+    def _extra_handler(self, name: str):
+        """Find cmd_<name> in the feature packs (features.py, games.py, webtools.py).
+
+        They are optional modules: if one is missing from an older checkout the
+        bot keeps working, the command simply stays unknown.
+        """
+        for attr in ("features", "games", "webtools"):
+            pack = getattr(self.bot, attr, None)
+            if pack is None:
+                continue
+            handler = getattr(pack, f"cmd_{name}", None)
+            if handler is not None:
+                return handler
+        return None
 
     # ---------------------------------------------------------------- router
 
@@ -122,6 +238,9 @@ class Commands:
         name, args = self.parse(text)
         handler = getattr(self, f"cmd_{name}", None)
         if handler is None:
+            # Not a core command - maybe one of the optional feature packs.
+            handler = self._extra_handler(name)
+        if handler is None:
             await self.reply(event, f"❓ دستور ناشناس: /{name}\n\n{HELP}")
             return True
         try:
@@ -134,7 +253,7 @@ class Commands:
     # --------------------------------------------------------------- control
 
     async def cmd_help(self, event, args) -> None:
-        await self.reply(event, HELP)
+        await self.reply(event, HELP + "\n" + EXTRA_HELP)
 
     async def cmd_on(self, event, args) -> None:
         self._store().set("enabled", True)

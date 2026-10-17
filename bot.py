@@ -32,12 +32,15 @@ from telethon.tl.functions.contacts import GetContactsRequest
 from telethon.tl.types import User
 
 from commands import Commands
+from features import Features
+from games import Games
 from notify import Notifier
 from panel import Panel
 from paths import OFFLINE_LOG, PAUSE_FLAG
 from presence import OfflineTimer, Watcher, idle_verdict
 from reports import Reporter
 from store import Store
+from webtools import WebTools
 from tg import (
     account_line,
     admin_ids,
@@ -154,6 +157,11 @@ class Bot:
         self.reporter = Reporter(self.store, self.notifier, lambda: self.settings)
         self.panel = Panel(self.store, self.notifier, self.status_text, self.reply_as_owner)
         self.commands = Commands(self)
+        # Feature packs: plain bags of cmd_<name> methods. Commands.handle() looks
+        # them up by name, so adding a tool never touches the router again.
+        self.features = Features(self)
+        self.games = Games(self)
+        self.webtools = WebTools(self)
         self.last_activity = 0.0  # 0 = the owner has not sent anything since startup
         self.forced_away = False  # the self-test can pretend the owner is away
         self._away_cache: tuple[float, bool, str] | None = None
@@ -200,6 +208,33 @@ class Bot:
     async def send_to(self, peer, text: str):
         """Send something through the human account and return the message."""
         return await self.send(peer, text, label="report")
+
+    async def reply_to(self, event, text: str, label: str = "answer") -> None:
+        """Answer wherever the command came from.
+
+        Commands typed in Saved Messages or a DM arrive on the human account, and
+        the answer goes out as the human account - the same as always. The very
+        same command typed in the control-bot chat arrives on the *bot* client
+        instead, and the human session cannot even see that chat (a userbot may
+        not write to a bot it has no conversation with), so answer through
+        whichever client the event actually came in on.
+        """
+        client = getattr(event, "client", None)
+        if client is not None and client is not self.owner:
+            try:
+                return await client.send_message(event.chat_id, text)
+            except Exception as exc:  # noqa: BLE001
+                log(f"reply_to through the event client failed: {exc!r}")
+        return await self.send(event.chat_id, text, label=label)
+
+    async def send_file_to(self, event, path: str, caption: str = "") -> None:
+        """Send a file the same way: out as whoever received the command."""
+        client = getattr(event, "client", None) or self.owner
+        try:
+            return await client.send_file(event.chat_id, path, caption=caption)
+        except Exception as exc:  # noqa: BLE001
+            log(f"send_file failed: {exc!r}")
+            await self.reply_to(event, f"⚠️ {exc!r}")
 
     async def control_client(self):
         """The control-bot client, opened once on first use.

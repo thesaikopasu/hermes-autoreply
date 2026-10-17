@@ -32,11 +32,12 @@ Console output is ASCII/English on purpose (the Windows console mangles Persian)
 from __future__ import annotations
 
 import asyncio
+import ast
 import os
 import sys
 
 from bot import SESSION_PATH, Bot
-from commands import COMMAND_NAMES, HELP, Commands
+from commands import COMMAND_NAMES, EXTRA_HELP, HELP, Commands
 from reports import Reporter
 from store import Store
 from tg import REQUIRED_ENV, account_line, log, mask, open_user_client, optional_env
@@ -44,6 +45,21 @@ from paths import DATA_DIR, DB_PATH, LOG_PATH
 
 
 # --------------------------------------------------------------------- checks
+
+
+def _packs() -> dict:
+    """The optional feature packs present in this checkout (name -> class).
+
+    They are imported lazily and defensively: an older checkout without
+    features.py/games.py/webtools.py still runs, it just has fewer commands.
+    """
+    packs: dict = {}
+    for module, cls in (("features", "Features"), ("games", "Games"), ("webtools", "WebTools")):
+        try:
+            packs[module] = getattr(__import__(module), cls)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  note: {module}.py not available ({exc.__class__.__name__}: {exc})")
+    return packs
 
 
 def env_check(quiet: bool = False) -> int:
@@ -114,15 +130,79 @@ def db_check() -> int:
     return 0
 
 
+# Names of the helper methods that actually put text into a Telegram message.
+SEND_CALLS = {"reply", "send", "send_message", "answer", "notify", "safe_send", "send_file", "manual_send"}
+
+
+def head_literals(node, depth: int = 4) -> list[str]:
+    """Literals a message built from `node` could start with.
+
+    Only the leftmost piece of a concatenation can be the start of a message:
+    "✅ done" + "\\n/help" never looks like a command, but "/help" + "✅" does.
+    """
+    if depth <= 0 or node is None:
+        return []
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return head_literals(node.left, depth - 1)
+    if isinstance(node, ast.JoinedStr):
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                return [part.value]
+            return []  # starts with a computed value, not a literal
+        return []
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.IfExp):
+        return head_literals(node.body, depth - 1) + head_literals(node.orelse, depth - 1)
+    if isinstance(node, ast.Call):
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        if name == "t":  # the bilingual helper: both variants are shown eventually
+            out: list[str] = []
+            for inner in node.args:
+                out.extend(head_literals(inner, depth - 1))
+            return out
+    return []
+
+
+def command_loop_scan(modules: tuple[str, ...]) -> list[str]:
+    """Message texts that would be parsed as commands if the bot ever sent them."""
+    risky: list[str] = []
+    here = os.path.dirname(os.path.abspath(__file__))
+    for module in modules:
+        path = os.path.join(here, f"{module}.py")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                tree = ast.parse(fh.read(), filename=path)
+        except (OSError, SyntaxError) as exc:
+            print(f"  could not scan {module}.py: {exc!r}")
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            if name not in SEND_CALLS:
+                continue
+            for arg in [*node.args, *[kw.value for kw in node.keywords]]:
+                for prefix in head_literals(arg):
+                    if prefix.lstrip().startswith("/"):
+                        risky.append(f"{module}.py:{node.lineno} {prefix.strip()[:48]!r}")
+    return risky
+
+
 def commands_check() -> int:
     """The command table must be complete, and no bot reply may start with '/'."""
     print("--- command table ---")
     missing = []
+    packs = _packs()
     for name in COMMAND_NAMES:
         handler = getattr(Commands, f"cmd_{name}", None)
-        documented = name in HELP
-        print(f"  /{name:<16} {'ok' if handler else 'MISSING HANDLER':<16} documented={documented}")
-        if handler is None:
+        owner = "Commands" if handler else ""
+        for pack_name, cls in packs.items():
+            if not owner and getattr(cls, f"cmd_{name}", None):
+                owner = pack_name
+        documented = name in HELP or name in EXTRA_HELP
+        print(f"  /{name:<16} {owner or 'MISSING HANDLER':<16} documented={documented}")
+        if not owner:
             missing.append(name)
     print(f"  total: {len(COMMAND_NAMES)} commands, {len(missing)} broken")
     print("--- parser samples ---")
@@ -134,15 +214,29 @@ def commands_check() -> int:
     print("--- command-loop guard: bot answers must not look like commands ---")
     texts = [
         HELP,
+        EXTRA_HELP,
         "✅ ربات روشن شد.",
         "🟢 ربات پاسخ‌خودکار روشن شد.",
         "📊 گزارش روزانه",
         "⚠️ خطای ربات",
         "🚫 لیست نادیده‌گرفتن:",
+        "❓ /qr <متن یا لینک>",
+        "🧮 /calc <عبارت>   مثال: /calc 2^10 + sqrt(81)",
+        "🃏 دست تو:",
+        "✊✋✌️ /rps سنگ | کاغذ | قیچی",
     ]
     bad = [t[:14] for t in texts if Commands.looks_like_command(t)]
+
+    # Static sweep: a message the bot sends must never *start* with '/', or the
+    # bot's own answer comes back as a command and the two keep answering each
+    # other forever. The check follows concatenations and the bilingual helper.
+    risky = command_loop_scan(("commands", "features", "games", "webtools", "panel", "notify", "reports"))
+
     print(f"  replies that would be parsed as commands: {bad or 'none'}")
-    return 1 if (missing or bad) else 0
+    print(f"  messages starting with '/': {len(risky)}")
+    for item in risky:
+        print(f"    {item}")
+    return 1 if (missing or bad or risky) else 0
 
 
 def decisions_check() -> int:
@@ -298,6 +392,230 @@ async def run_bot(with_selftest: bool = False) -> int:
         await bot.shutdown()
 
 
+def tools_check(with_net: bool = False) -> int:
+    """Offline test of the tool/game packs (features.py, games.py, webtools.py).
+
+    Everything here runs without Telegram: the calculator, the plotter, the
+    solver, QR encode+decode, the timezone table and the game logic. Network
+    tools (weather, wikipedia) are only checked when --net is given.
+    """
+    import inspect
+    import os
+    import tempfile
+
+    packs = _packs()
+    WebTools = packs.get("webtools")
+    Games = packs.get("games")
+    if WebTools is None:
+        print("  webtools.py is missing - cannot check the tool commands")
+        return 1
+    # safe_calc and zone_for are module-level helpers in webtools.py, not methods.
+    import importlib
+
+    webtools_module = importlib.import_module("webtools")
+    safe_calc, zone_for = webtools_module.safe_calc, webtools_module.zone_for
+
+    failures: list[str] = []
+
+    def check(name: str, got, expected=None, ok: bool | None = None) -> None:
+        good = ok if ok is not None else got == expected
+        print(f"  {'ok  ' if good else 'FAIL'} {name:<38} {got}")
+        if not good:
+            failures.append(name)
+
+    print("--- every command resolves to a handler, async (event, args) ---")
+    for name in COMMAND_NAMES:
+        handler = getattr(Commands, f"cmd_{name}", None)
+        owner = "commands" if handler else ""
+        for pack_name, cls in packs.items():
+            if not owner and getattr(cls, f"cmd_{name}", None):
+                handler, owner = getattr(cls, f"cmd_{name}"), pack_name
+        params = list(inspect.signature(handler).parameters)[1:] if handler else []
+        good = bool(handler) and inspect.iscoroutinefunction(handler) and params == ["event", "args"]
+        check(f"/{name}", f"{owner or 'MISSING'} {'async' if good else 'BAD SIGNATURE'}", ok=good)
+
+    print("--- calculator (safe_calc, no eval) ---")
+    for expression, expected in (
+        ("2+3*4", 14),
+        ("2^10", 1024),
+        ("sqrt(81)", 9),
+        ("(2+3)*(4-1)/3", 5),
+        ("factorial(5)", 120),
+    ):
+        value, error = safe_calc(expression)
+        check(f"{expression} = {expected}", value, expected, ok=(not error and value == expected))
+    for bad in ("10/0", "__import__('os').system('echo hi')", "x+1", ""):
+        value, error = safe_calc(bad)
+        check(f"rejected: {bad[:22]!r}", error or "NO ERROR", ok=bool(error))
+
+    print("--- plot / solve ---")
+    path = WebTools._draw("x^2 - 3", -5, 5)
+    check("plot file written", os.path.getsize(path) > 2000, ok=os.path.getsize(path) > 2000)
+    os.remove(path)
+    answer = WebTools._solve("x^2-4=0")
+    check("solve x^2-4=0", answer.replace("\n", " | ")[:60], ok=("2" in answer and "-2" in answer))
+
+    print("--- QR round trip (make with qrcode, read back with opencv) ---")
+    import qrcode
+
+    text = "https://example.com/auto-reply-test"
+    tmp = os.path.join(tempfile.gettempdir(), "qr_selftest.png")
+    qrcode.make(text).save(tmp)
+    decoded = WebTools._read_qr(tmp)
+    os.remove(tmp)
+    check("decoded == encoded", decoded, text, ok=(decoded == text))
+
+    print("--- clock ---")
+    check("zone_for('شیراز')", zone_for("شیراز")[1] if zone_for("شیراز") else None, "Asia/Tehran")
+    check("zone_for('tokyo')", zone_for("tokyo")[1] if zone_for("tokyo") else None, "Asia/Tokyo")
+    check("zone_for('زیمبابوه') unknown", zone_for("زیمبابوه"), None)
+
+    print("--- games ---")
+    if Games is None:
+        check("games.py present", "missing", ok=False)
+    else:
+        check("dooz winner XXX------", Games._winner("XXX------"), "X")
+        check("dooz full board draw", Games._winner("XOXXOOOXX"), "draw")
+        check("dooz bot blocks (XX-------) -> 2", Games._best_move("XX-------"), 2)
+        check("dooz bot wins  (OO------X) -> 2", Games._best_move("OO------X"), 2)
+        view = Games._word_view({"word": "کتاب", "guessed": "اک", "wrong": 1})
+        check("hangman view", view.replace("\n", " | ")[:40], ok="▁" in view and "❤️" in view)
+        cities = importlib.import_module("games").CITIES
+        check("every ready city has coordinates", len(cities), ok=len(cities) >= 20)
+
+    if with_net:
+        print("--- network tools (live) ---")
+
+        async def _live_weather() -> dict | None:
+            from webtools import fetch_json as fj
+
+            geo = await fj(
+                "https://geocoding-api.open-meteo.com/v1/search?count=1&language=fa&name=" + "Shiraz"
+            )
+            if not geo or not geo.get("results"):
+                return None
+            place = geo["results"][0]
+            return await fj(
+                "https://api.open-meteo.com/v1/forecast?current=temperature_2m&timezone=auto"
+                f"&latitude={place['latitude']}&longitude={place['longitude']}"
+            )
+
+        async def _live_wiki() -> str:
+            return await WebTools._wiki_summary("fa", "تهران")
+
+        data = asyncio.run(_live_weather())
+        check("open-meteo returns a temperature", (data or {}).get("current"), ok=bool((data or {}).get("current")))
+        page = asyncio.run(_live_wiki())
+        check("fa.wikipedia summary of تهران", page.replace("\n", " | ")[:60], ok=bool(page))
+
+    print("--- message routing (an answer goes out as whoever got the command) ---")
+
+    sent: list[tuple] = []
+
+    class _Client:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def send_message(self, peer, text):
+            sent.append((self.name, peer, text))
+            return object()
+
+        async def send_file(self, peer, path, caption=""):
+            sent.append((self.name, peer, caption))
+            return object()
+
+    class _Event:
+        def __init__(self, client, chat_id=777):
+            self.client, self.chat_id = client, chat_id
+
+    class _FakeBot:
+        """Just enough of Bot for the two routing methods (no credentials needed)."""
+
+        owner = _Client("human")
+
+        async def send(self, peer, text, label="send"):
+            sent.append(("human", peer, text))
+            return object()
+
+    import bot as bot_module
+
+    fake = _FakeBot()
+    asyncio.run(bot_module.Bot.reply_to(fake, _Event(_FakeBot.owner), "from saved messages"))
+    check("Saved Messages answer -> human account", sent[-1][0], "human")
+    asyncio.run(bot_module.Bot.reply_to(fake, _Event(_Client("control-bot")), "from the panel"))
+    check("control-bot answer -> control bot", sent[-1][0], "control-bot")
+    asyncio.run(bot_module.Bot.send_file_to(fake, _Event(_Client("control-bot")), "/tmp/x.png", "cap"))
+    check("file from the panel -> control bot", sent[-1][0], "control-bot")
+
+    print("--- every name the packs import from a sibling module exists ---")
+    import ast
+
+    siblings = {"commands", "store", "tg", "paths", "reports", "notify", "panel", "presence", "bot"}
+    for module_name in ("features", "games", "webtools", "commands"):
+        with open(f"{module_name}.py", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.module not in siblings:
+                continue
+            target = importlib.import_module(node.module)
+            for alias in node.names:
+                check(
+                    f"{module_name}: from {node.module} import {alias.name}",
+                    hasattr(target, alias.name),
+                    True,
+                )
+
+    print("--- end to end: the router finds the pack handler and answers in place ---")
+    import types
+
+    Features = packs.get("features")
+    if Features is None:
+        check("features.py present (needed for /tools)", False, ok=False)
+        print(f"--- {len(failures)} failure(s) ---")
+        return 1
+
+    class _PackBot:
+        """A Bot stand-in. The packs only ever touch these few things."""
+
+        owner = _Client("human")
+
+        def __init__(self) -> None:
+            # Same wiring bot.py does, so the router sees all three packs.
+            self.features = packs["features"](self)
+            self.webtools = packs["webtools"](self)
+            self.games = packs["games"](self) if "games" in packs else None
+            self.store = None
+
+        async def send(self, peer, text, label="send"):
+            sent.append(("human", peer, text))
+            return object()
+
+    pack_bot = _PackBot()
+    # Use the real routing methods, only the clients are fake.
+    pack_bot.reply_to = types.MethodType(bot_module.Bot.reply_to, pack_bot)
+    pack_bot.send_file_to = types.MethodType(bot_module.Bot.send_file_to, pack_bot)
+    router = Commands(pack_bot)
+    panel_event = _Event(_Client("control-bot"))
+
+    claimed = asyncio.run(router.run_extra(panel_event, "/definitely_not_a_command"))
+    check("router ignores an unknown command", claimed, False)
+    before = len(sent)
+    claimed = asyncio.run(router.run_extra(panel_event, "/tools"))
+    answer = sent[before][2] if len(sent) > before else "(nothing was sent)"
+    check(
+        "router runs /tools and answers from the panel",
+        f"claimed={claimed} via={sent[before][0]} {answer.splitlines()[0][:24]!r}",
+        ok=claimed and sent[before][0] == "control-bot" and not answer.startswith("⚠️"),
+    )
+    before = len(sent)
+    claimed = asyncio.run(router.run_extra(panel_event, "/calc 2^10 + sqrt(81)"))
+    answer = sent[before][2] if len(sent) > before else "(nothing was sent)"
+    check("router runs /calc", answer[:34], ok=claimed and "1033" in answer)
+
+    print(f"--- {len(failures)} failure(s) ---")
+    return 1 if failures else 0
+
+
 def main(argv: list[str]) -> int:
     if "--env-check" in argv:
         return env_check()
@@ -305,6 +623,8 @@ def main(argv: list[str]) -> int:
         return db_check()
     if "--commands-check" in argv:
         return commands_check()
+    if "--tools-check" in argv:
+        return tools_check("--net" in argv)
     if "--test-decisions" in argv:
         return decisions_check()
     if "--daily-preview" in argv:

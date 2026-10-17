@@ -4,3 +4,23 @@ telethon==1.45.0
 python-dotenv==1.1.1
 python-socks[asyncio]==2.7.2
 cryptg==0.5.0
+
+# --- tools (/calc, /plot, /solve, /qr, /qrscan, /time) ----------------------
+# Every one of them is optional at runtime: if a package is missing, only the
+# command that needs it fails with a clear message - the bot still starts and
+# auto-replies. Install the whole file to get all of them.
+#
+# qrcode + Pillow  -> /qr       (make a QR image)
+qrcode==8.2
+Pillow==12.3.0
+# opencv-python-headless -> /qrscan  (decode a QR from a photo; headless = no
+# GUI libraries, so it also installs on a server without X11)
+opencv-python-headless==5.0.0.93
+numpy==2.5.4
+# matplotlib -> /plot  (render the graph with the Agg backend, headless)
+matplotlib==3.11.2
+# sympy -> /solve  (solve equations symbolically)
+sympy==1.14.0
+# tzdata -> /time  (Windows and slim Docker images ship no tz database, and
+# without it zoneinfo cannot resolve names like Asia/Tehran)
+tzdata==2026.5

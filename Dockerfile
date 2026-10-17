@@ -53,6 +53,13 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
     DATA_DIR=/data
 
+# libgomp1 is the OpenMP runtime the prebuilt numpy/opencv wheels link against.
+# python:3.12-slim does not always ship it, and without it /plot and /qrscan die
+# at import time with a shared-library error, while the rest of the bot is fine.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
 # Unprivileged runtime user with a fixed uid, so an operator can chown a
 # mounted volume to it if needed.
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser

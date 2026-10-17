@@ -46,3 +46,7 @@ resume.cmd
 status.cmd
 supervisor.log
 archive/
+
+# The old Windows startup shortcut, kept here disabled on purpose.
+# It names a local folder, so it is not part of the published tree either.
+autostart-off/

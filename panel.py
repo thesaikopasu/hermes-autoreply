@@ -753,7 +753,27 @@ class Panel:
         elif command == "/help":
             await self._reply(event, HELP_TEXT, _rows(self._footer()))
         else:
+            if await self._run_extra(event, text):
+                return
             await self._reply(event, "🤷🏻 این دستور را نمی‌شناسم. /help را بزن.", _rows(self._footer()))
+
+    async def _run_extra(self, event, text: str) -> bool:
+        """Let the feature packs answer a command this panel does not know.
+
+        The panel owns its short command set (/menu /status /on …); everything
+        else - /qr /plot /time /dooz and the rest - is handled by the same
+        handlers the userbot uses, and the answer comes back through this bot.
+        """
+        commands = getattr(self.bot, "commands", None)
+        runner = getattr(commands, "run_extra", None)
+        if not callable(runner):
+            return False
+        try:
+            return bool(await runner(event, text))
+        except Exception as exc:  # noqa: BLE001
+            _log(f"panel: extra command failed ({classify_code(exc)[0]})")
+            await self._reply(event, f"⚠️ {classify_code(exc)[0]}")
+            return True
 
     async def _consume_input(self, event, owner_id: int, text: str, pending: tuple) -> None:
         """Use the owner's next plain text as the value of an open flow."""

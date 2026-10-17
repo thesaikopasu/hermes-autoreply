@@ -45,6 +45,8 @@ Everything is written under `DATA_DIR`:
 - A bot created with **@BotFather** (free, takes a minute).
 - Dependencies: `pip install -r requirements.txt` (telethon, python-dotenv, python-socks, cryptg).
 
+The tools and games need a few more packages, all listed in the same file: `qrcode` + `Pillow` (`/qr`), `opencv-python-headless` (`/qrscan`), `matplotlib` + `numpy` (`/plot`), `sympy` (`/solve`) and `tzdata` (`/time`). They are **optional**: install the file and you get every command, but if a package is missing the bot still starts and auto-replies — only the one command that needs it answers with a short "not installed" message.
+
 ## Local setup
 
 **1. Get `API_ID` and `API_HASH`** — open <https://my.telegram.org>, log in with the phone number of the account that will auto-reply, go to *API development tools*, create an application if you have none, and copy the two values.
@@ -94,7 +96,7 @@ At startup the process prints a health line, for example:
 
 If the control bot cannot reach you, the log says so in one line and the userbot keeps running: open the bot in Telegram and press /start once.
 
-Useful checks that need no Telegram connection: `python auto_reply.py --env-check`, `--db-check`, `--commands-check`, `--test-decisions`, `--daily-preview`. With credentials in place, `--presence-check` shows which accounts connect and whether you currently count as away, and `--self-test` exercises the whole reply pipeline.
+Useful checks that need no Telegram connection: `python auto_reply.py --env-check`, `--db-check`, `--commands-check`, `--tools-check` (`--tools-check --net` also hits the live weather/Wikipedia endpoints), `--test-decisions`, `--daily-preview`. With credentials in place, `--presence-check` shows which accounts connect and whether you currently count as away, and `--self-test` exercises the whole reply pipeline.
 
 ## Environment variables
 
@@ -116,6 +118,68 @@ All configuration is read from the environment at runtime. `python-dotenv` also 
 | `PROXY` | no | empty | Proxy for a blocked or filtered network: `socks5://user:pass@host:port`, `http://host:port`, or `host:port:secret` for an MTProxy. |
 
 The behaviour values (`report_mode`, `cooldown_minutes`, the spam threshold and window, the reply texts, the daily-report time) live in `state.db`, seeded from `config.json`, and are edited live from the control-bot panel. Setting their environment counterparts is a way to declare the intended defaults for a fresh deployment, not a hard override of what the database already holds.
+
+## Commands
+
+Type them in **Saved Messages** (the chat with yourself) or in the **control-bot chat** — both work, and the bot answers in the same chat. Only `OWNER_ID` is ever answered. `/help` prints the same list in Persian.
+
+The first block is the core bot; the other three come from the optional feature packs (`features.py`, `webtools.py`, `games.py`), each of which is a plain set of `cmd_<name>` methods.
+
+### Bot control
+| Command | What it does |
+| --- | --- |
+| `/on` `/off` | turn the whole bot (replies + reports) on or off |
+| `/status` `/ping` | full state, and a health/online check |
+| `/set_delay <s>` | seconds offline before an auto-reply goes out (default 5) |
+| `/set_cooldown <min>` | minutes before the same person is answered again |
+| `/set_spam <count> <min>` | spam rule |
+| `/set_report_time <HH:MM>` / `/daily_on` `/daily_off` | daily report |
+| `/set_text`, `/set_spam_text`, `/set_group_text <text>` | the three reply texts, `{name}` = the other person |
+| `/ignore_add`, `/ignore_remove`, `/ignore_list` | people who are never answered |
+| `/group_add`, `/group_remove`, `/group_list` | groups where mentions get the group text |
+| `/report_mode <all\|offline_only>`, `/report_now`, `/errors_clear`, `/reload_config` | reports and maintenance |
+| `/help` | the whole command list |
+
+### Profile and messages
+| Command | What it does |
+| --- | --- |
+| `/bioclock <template>` | put a live clock in your bio (`{time}` is replaced), `/biofont`, `/biotemplate` |
+| `/autoread on\|off` | mark incoming messages as read |
+| `/replymode <all\|offline\|never>` | when to answer |
+| `/alerts on\|off` | notify you when someone comes online or goes away |
+| `/alwaysonline on\|off` | keep your status online |
+| `/font <b\|i\|u\|s\|mono\|caps\|small> <text>` | restyle text, `/tr` converts the keyboard |
+| `/prefix <text>` | a prefix for the replies |
+| `/quick add\|del\|list` , `/quick <key>` | saved quick replies |
+| `/fwd save\|go\|list\|del` | store a message and send it later |
+| `/mention <@user>` | mention without typing the name |
+| `/watchprof on\|off` | tell me when a contact changes their profile |
+| `/copyprof <@user>` | copy someone's name/photo/bio, `/whois`, `/findnum` |
+
+### Tools
+| Command | What it does |
+| --- | --- |
+| `/qr <text>` / `/qrscan` (reply to a photo) | make or read a QR code |
+| `/calc <expression>` | calculator (`/calc 2^10 + sqrt(81)`) |
+| `/plot <function> [from] [to]` | graph a function, e.g. `/plot sin(x)/x -20 20` |
+| `/solve <equation>` | solve it symbolically, e.g. `/solve x^2 - 5x + 6 = 0` |
+| `/time <city>` | the time there (`/time شیراز`) |
+| `/weather <city>` | current weather, no API key |
+| `/wiki <topic>` | a Persian Wikipedia summary |
+| `/tools` | the list of everything in here |
+
+### Fun and games
+| Command | What it does |
+| --- | --- |
+| `/loc <city\|lat,lon> [minutes]` | a fake live location for that long |
+| `/fun` | ten small time-killers (`/fun 1` … `/fun 10`) |
+| `/rps سنگ\|کاغذ\|قیچی` | rock-paper-scissors with a score |
+| `/dooz new` · `/dooz <1-9>` | tic-tac-toe against the bot |
+| `/word new` · `/word <letter>` | hangman |
+| `/hokm start` · `/hokm <خشت\|دل\|گشنیز\|پیك>` | a simple hokm |
+| `/play <number>` | play a card in hokm |
+
+These are all plain text — the human account cannot send inline buttons, so every game and menu answers to a typed number or word.
 
 ## Deploy on Railway
 
@@ -173,7 +237,10 @@ Text commands, if you prefer typing: `/menu`, `/status`, `/on`, `/off`, `/ignore
 | `notify.py` | notifications to the owner through the control bot |
 | `panel.py` | the inline-button control panel |
 | `reports.py` | message report, daily report, error report |
-| `commands.py` | text commands |
+| `commands.py` | text commands (the core set + the router that finds pack commands) |
+| `features.py` | feature pack: bio clock, fonts, quick replies, profile copy, alerts, shortcuts |
+| `webtools.py` | feature pack: `/qr`, `/qrscan`, `/calc`, `/plot`, `/solve`, `/time`, `/weather`, `/wiki` |
+| `games.py` | feature pack: fake live location, mini games, tic-tac-toe, hangman, hokm |
 | `paths.py` | the single place that resolves `DATA_DIR` and every file inside it |
 | `config.json` | default settings and reply texts, imported into the database |
 | `Dockerfile`, `Procfile`, `railway.json` | deployment (see `deploy/README-deploy.md`) |

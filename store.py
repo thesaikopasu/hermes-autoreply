@@ -24,7 +24,7 @@ import os
 import sqlite3
 import time
 
-from paths import CONFIG_PATH, DB_PATH  # single place that decides where files live
+from paths import CONFIG_PATH, DB_PATH, HERE  # single place that decides where files live
 
 # Fallback values, used when neither the database nor config.json has the key.
 DEFAULTS: dict = {
@@ -107,6 +107,20 @@ class Store:
         c.execute("CREATE TABLE IF NOT EXISTS traffic (sender_id INTEGER, chat_id INTEGER, ts REAL, kind TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS names (user_id INTEGER PRIMARY KEY, name TEXT, username TEXT, ts REAL)")
         c.execute("CREATE TABLE IF NOT EXISTS warns (sender_id INTEGER, ts REAL)")
+        # --- features added later (دسته الف/ج/ح/ز). New tables only, never rewritten.
+        c.execute("CREATE TABLE IF NOT EXISTS quick_replies (\"key\" TEXT PRIMARY KEY, text TEXT, added REAL)")
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS forwards (\"key\" TEXT PRIMARY KEY, chat_id INTEGER, "
+            "msg_id INTEGER, label TEXT, media INTEGER, added REAL)"
+        )
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS profiles (user_id INTEGER PRIMARY KEY, name TEXT, "
+            "username TEXT, photo_id INTEGER, ts REAL)"
+        )
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS game_state (chat_id INTEGER, game TEXT, state TEXT, ts REAL, "
+            "PRIMARY KEY (chat_id, game))"
+        )
         c.execute("CREATE INDEX IF NOT EXISTS idx_traffic_ts ON traffic (ts)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_msgs_sender_ts ON msgs (sender_id, ts)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_replies_sender_ts ON replies (sender_id, ts)")
@@ -369,6 +383,106 @@ class Store:
         self.conn.execute("DELETE FROM error_state")
         self.conn.commit()
 
+    # ------------------------------------------------- extras (features/games)
+
+    def quick_add(self, key: str, text: str) -> None:
+        self.conn.execute(
+            "INSERT INTO quick_replies (\"key\", text, added) VALUES (?, ?, ?) "
+            "ON CONFLICT(\"key\") DO UPDATE SET text = excluded.text",
+            (key.strip(), text, time.time()),
+        )
+        self.conn.commit()
+
+    def quick_get(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT text FROM quick_replies WHERE \"key\" = ?", (key.strip(),)).fetchone()
+        return str(row["text"]) if row is not None else None
+
+    def quick_del(self, key: str) -> bool:
+        cur = self.conn.execute("DELETE FROM quick_replies WHERE \"key\" = ?", (key.strip(),))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def quick_list(self) -> list[dict]:
+        rows = self.conn.execute("SELECT \"key\", text FROM quick_replies ORDER BY added").fetchall()
+        return [{"key": r["key"], "text": r["text"]} for r in rows]
+
+    def fwd_add(self, key: str, chat_id: int, msg_id: int, label: str, media: bool = False) -> None:
+        self.conn.execute(
+            "INSERT INTO forwards (\"key\", chat_id, msg_id, label, media, added) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(\"key\") DO UPDATE SET chat_id = excluded.chat_id, msg_id = excluded.msg_id, "
+            "label = excluded.label, media = excluded.media",
+            (key.strip(), int(chat_id), int(msg_id), label, 1 if media else 0, time.time()),
+        )
+        self.conn.commit()
+
+    def fwd_get(self, key: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT chat_id, msg_id, label FROM forwards WHERE \"key\" = ?", (key.strip(),)
+        ).fetchone()
+        return {"chat_id": row["chat_id"], "msg_id": row["msg_id"], "label": row["label"]} if row else None
+
+    def fwd_del(self, key: str) -> bool:
+        cur = self.conn.execute("DELETE FROM forwards WHERE \"key\" = ?", (key.strip(),))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def fwd_list(self) -> list[dict]:
+        rows = self.conn.execute("SELECT \"key\", chat_id, msg_id, label FROM forwards ORDER BY added").fetchall()
+        return [{"key": r["key"], "chat_id": r["chat_id"], "msg_id": r["msg_id"], "label": r["label"]} for r in rows]
+
+    def profile_get(self, user_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT name, username, photo_id FROM profiles WHERE user_id = ?", (int(user_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        return {"name": row["name"], "username": row["username"], "photo_id": row["photo_id"]}
+
+    def profile_set(self, user_id: int, name: str | None, username: str | None, photo_id: int | None) -> None:
+        self.conn.execute(
+            "INSERT INTO profiles (user_id, name, username, photo_id, ts) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET name = excluded.name, username = excluded.username, "
+            "photo_id = excluded.photo_id, ts = excluded.ts",
+            (int(user_id), name, username, photo_id, time.time()),
+        )
+        self.conn.commit()
+
+    def profile_list(self, limit: int = 20) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT user_id, name, username FROM profiles ORDER BY ts DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+        return [{"user_id": r["user_id"], "name": r["name"], "username": r["username"]} for r in rows]
+
+    def count_kind(self, kind: str, seconds: float) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM traffic WHERE kind = ? AND ts > ?", (kind, time.time() - seconds)
+        ).fetchone()
+        return int(row["n"])
+
+    # --------------------------------------------------------------- games
+
+    def game_get(self, chat_id: int, game: str) -> dict:
+        row = self.conn.execute(
+            "SELECT state FROM game_state WHERE chat_id = ? AND game = ?", (int(chat_id), game)
+        ).fetchone()
+        if row is None or not row["state"]:
+            return {}
+        try:
+            return json.loads(row["state"])
+        except ValueError:
+            return {}
+
+    def game_set(self, chat_id: int, game: str, payload: dict) -> None:
+        if not payload:
+            self.conn.execute("DELETE FROM game_state WHERE chat_id = ? AND game = ?", (int(chat_id), game))
+        else:
+            self.conn.execute(
+                "INSERT INTO game_state (chat_id, game, state, ts) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, game) DO UPDATE SET state = excluded.state, ts = excluded.ts",
+                (int(chat_id), game, json.dumps(payload, ensure_ascii=False), time.time()),
+            )
+        self.conn.commit()
+
     def stats(self) -> dict:
         tables = {}
         for name in (
@@ -382,6 +496,10 @@ class Store:
             "traffic",
             "names",
             "warns",
+            "quick_replies",
+            "forwards",
+            "profiles",
+            "game_state",
         ):
             row = self.conn.execute(f"SELECT COUNT(*) AS n FROM {name}").fetchone()
             tables[name] = int(row["n"])
